@@ -313,7 +313,11 @@ class Terra_Git {
             } else {
                 $this->output("No files to upload.");
             }
-            
+                        
+            if (!empty($server['file_permissions'])) {
+                $this->setFilePermissions($connection, $server['file_permissions']);
+            }
+
             $this->output("Finished working on {$server['host']}{$server['path']}");
 
             ftp_close($connection);
