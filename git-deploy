@@ -264,7 +264,16 @@ class Terra_Git {
 
             $remoteRevision = $this->getRemoteRevisionContent($connection, 'REVISION');
             $previousRevision = $this->getRemoteRevisionContent($connection, 'PREVIOUS_REVISION');
-            $isFirstTimeDeploy = $remoteRevision === NULL;            
+            $isFirstTimeDeploy = $remoteRevision === NULL;
+            // clean working directory is required for first-time deploy to avoid massive file renaming while uploading (see below)
+            if ($isFirstTimeDeploy) {
+                $output = array();
+                exec('git status --porcelain', $output);
+                if (!empty($output)) {
+                    $this->output('First-time deployment requires clean working directory! Clean it please and retry!');
+                    exit;
+                }
+            }
 
             if ($revert) {
                 if (!isset($previousRevision)) {
@@ -334,6 +343,17 @@ class Terra_Git {
                     }
                 }
 
+                // first time we upload files as they are (working directory is clean)
+                if ($isFirstTimeDeploy) {
+                    $tmpFileToUpload = $file;
+                // other times we upload tmp file with content of $revision
+                } else {
+                    $tmpFileToUpload = GIT_DEPLOY_DIR . '/tmpFileToUpload';
+                    $command = "git show $revision:$file > $tmpFileToUpload";
+                    $output = array();
+                    exec($command, $output);
+                }
+
                 $uploaded = false;
                 $attempts = 1;
                 while (!$uploaded) {
@@ -345,7 +365,7 @@ class Terra_Git {
 
                     # This makes sure to repeat the upload until it finally succeeds.
                     # Hopefully helps fix a problem where some files aren't transferred.
-                    $uploaded = @ftp_put($connection, $file, $file, FTP_BINARY);
+                    $uploaded = @ftp_put($connection, $file, $tmpFileToUpload, FTP_BINARY);
 
                     if (!$uploaded) {
                         $attempts = $attempts + 1;
@@ -353,6 +373,7 @@ class Terra_Git {
                     }
                 }
                 $this->output("Uploaded {$file}");
+                unlink($tmpFileToUpload);
             }
 
             foreach ($filesToDelete as $file) {
