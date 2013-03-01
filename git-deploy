@@ -9,6 +9,7 @@
  * @todo command to update to specific revision (including previous, see issue #8)
  * @todo see if it ends in .ini, and if it does, don't append .ini
  */
+ini_set('max_execution_time', 0);
 
 $commands = array('-l', '-r');
 
