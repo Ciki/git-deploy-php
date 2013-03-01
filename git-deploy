@@ -109,8 +109,9 @@ class Terra_Git {
                 'port' => 21,
                 'path' => '/',
                 'passive' => true,
-                'clean_directories' => array()
-                    ), $options);
+                'clean_directories' => array(),
+                'file_permissions' => array(),
+            ), $options);
 
             if ($options['skip']) {
                 continue;
@@ -323,5 +324,24 @@ class Terra_Git {
 
             ftp_close($connection);
         }
+    }
+ 
+
+
+    /**
+     * Set 0777 file permissions for $items (create them if not present)
+     * @param ftp_handle
+     * @param array of files/directories to chmod
+     */
+    function setFilePermissions($connection, $items = array())
+    {
+        $mode = 0777;
+        foreach ($items as $path) {
+            if (!@ftp_chmod($connection, $mode, $path)) {
+                ftp_mkdir($connection, $path);
+                ftp_chmod($connection, $mode, $path);
+            }
+        }
+        $this->output('Permissions set.');
     }
 }
