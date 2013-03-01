@@ -264,6 +264,7 @@ class Terra_Git {
 
             $remoteRevision = $this->getRemoteRevisionContent($connection, 'REVISION');
             $previousRevision = $this->getRemoteRevisionContent($connection, 'PREVIOUS_REVISION');
+            $isFirstTimeDeploy = $remoteRevision === NULL;            
 
             if ($revert) {
                 if (!isset($previousRevision)) {
@@ -288,14 +289,18 @@ class Terra_Git {
             $filesToDelete = $files['delete'];
             unset($files);
 
+            $maintenanceModeTurnedOn = false;
             // turn on "Maintenance mode" before uploading
-            if ($server['maintenanceMode']) {
+            if ($server['maintenanceMode'] && !$isFirstTimeDeploy
+                && (count($filesToUpload) > 0 or count($filesToDelete) > 0)
+            ) {
                 $indexPath = $server['indexPath'];
                 $maintenancePath = $server['maintenancePath'];
                 $tmpIndexPath = $indexPath . '.tmp';
                 ftp_rename($connection, $indexPath, $tmpIndexPath);
                 ftp_rename($connection, $maintenancePath, $indexPath);
                 $this->output('Maintenance mode turned ON');
+                $maintenanceModeTurnedOn = true;
             }
             
             foreach ($filesToUpload as $file) {
@@ -387,7 +392,7 @@ class Terra_Git {
             }
             
             # when uploading done turn off "Maintenance mode"
-            if ($server['maintenanceMode']) {
+            if ($maintenanceModeTurnedOn) {
                 ftp_rename($connection, $indexPath, $maintenancePath);
                 ftp_rename($connection, $tmpIndexPath, $indexPath);
                 $this->output("Maintenance mode turned OFF");
