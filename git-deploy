@@ -110,6 +110,9 @@ class Terra_Git {
                 'port' => 21,
                 'path' => '/',
                 'passive' => true,
+                'maintenanceMode' => true,
+                'indexPath' => 'web/index.php',
+                'maintenancePath' => 'web/.maintenance.php',
                 'clean_directories' => array(),
                 'file_permissions' => array(),
             ), $options);
@@ -240,6 +243,16 @@ class Terra_Git {
             $filesToDelete = $files['delete'];
             unset($files);
 
+            // turn on "Maintenance mode" before uploading
+            if ($server['maintenanceMode']) {
+                $indexPath = $server['indexPath'];
+                $maintenancePath = $server['maintenancePath'];
+                $tmpIndexPath = $indexPath . '.tmp';
+                ftp_rename($connection, $indexPath, $tmpIndexPath);
+                ftp_rename($connection, $maintenancePath, $indexPath);
+                $this->output('Maintenance mode turned ON');
+            }
+            
             foreach ($filesToUpload as $file) {
                 # Make sure the folder exists in the FTP server.
 
@@ -312,6 +325,13 @@ class Terra_Git {
                 $this->output("Uploaded REVISION file");                
             } else {
                 $this->output("No files to upload.");
+            }
+            
+            # when uploading done turn off "Maintenance mode"
+            if ($server['maintenanceMode']) {
+                ftp_rename($connection, $indexPath, $maintenancePath);
+                ftp_rename($connection, $tmpIndexPath, $indexPath);
+                $this->output("Maintenance mode turned OFF");
             }
                         
             if (!empty($server['file_permissions'])) {
