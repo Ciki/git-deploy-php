@@ -32,6 +32,19 @@ $revision = isset($opts['r']) ? $opts['r'] : 'HEAD';
 
 $revert = isset($opts['revert']);
 
+
+/**
+ * Get local path to file containing revision deployed to server.
+ * @global string $deploy
+ * @return string
+ */
+function getRemoteRevisionLocalFilepath()
+{
+    global $deploy;
+    return GIT_DEPLOY_DIR . '/REMOTE_REVISION-' . basename($deploy, '.ini');
+}
+
+
 try {
     $git = new Terra_Git();
     if (!$list) {
@@ -42,7 +55,13 @@ try {
             $git->deploy($revision);
         }
     } else {
-        $files = $git->getFilesToUpload();
+        $remoteRevisionLocalFilePath = getRemoteRevisionLocalFilepath();
+        if (file_exists($remoteRevisionLocalFilePath)) {
+            $remoteRevision = trim(file_get_contents($remoteRevisionLocalFilePath));
+        } else {
+            $remoteRevision = NULL;
+        }
+        $files = $git->getFilesToUpload($remoteRevision, $revision);
         if (count($files['upload']) > 0) {
             $git->output("Files to upload:");
             foreach ($files['upload'] as $fileToUpload) {
@@ -350,6 +369,9 @@ class Terra_Git {
                 ftp_put($connection, 'REVISION', $temp, FTP_BINARY);
                 unlink($temp);
                 $this->output("Uploaded REVISION file.");
+                
+                file_put_contents(getRemoteRevisionLocalFilepath(), $revision);
+                $this->output("Stored local REMOTE_REVISION file.");
 
                 # Upload file containing the current revision, for reverting when necessary.
                 # But, only if the revision we're deploying is different from the one currently deployed.
