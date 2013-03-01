@@ -234,8 +234,10 @@ class Terra_Git {
                 fseek($tmpFile, 0);
                 $remoteRevision = trim(fread($tmpFile, 1024));
                 fclose($tmpFile);
+                $this->output('remote revision: ' . $remoteRevision);
             } else {
                 # Couldn't get the file. I assume it's because the file didn't exist.
+                $this->output('remote revision not fetched! First-time deploy?');
             }
 
             $files = $this->getFilesToUpload($remoteRevision);
