@@ -202,7 +202,7 @@ class Terra_Git {
 
         # Let's make sure the $path ends with a slash.
 
-        if (substr($server['path'], strlen($server['path']) - 1, strlen($server['path'])) !== '/') {
+        if (substr($server['path'], -1) !== '/') {
             $server['path'] = $server['path'] . '/';
         }
 
@@ -235,30 +235,10 @@ class Terra_Git {
 
             # Now that we're logged in to the server, let's get the remote revision.
 
-            $remoteRevision = '';
-
-            $tmpFile = tmpfile();
-
-            if (@ftp_fget($connection, $tmpFile, 'REVISION', FTP_ASCII)) {
-                fseek($tmpFile, 0);
-                $remoteRevision = trim(fread($tmpFile, 1024));
-                fclose($tmpFile);
-            } else {
-                # Couldn't get the file. I assume it's because the file didn't exist.
-            }
-
-            $tmpFile = tmpfile();
-
-            if (@ftp_fget($connection, $tmpFile, 'PREVIOUS_REVISION', FTP_ASCII)) {
-                fseek($tmpFile, 0);
-                $previousRevision = trim(fread($tmpFile, 1024));
-                fclose($tmpFile);
-            } else {
-                # Couldn't get the file. I assume it's because the file didn't exist.
-            }
+            $remoteRevision = $this->getRemoteRevisionContent($connection, 'REVISION');
+            $previousRevision = $this->getRemoteRevisionContent($connection, 'PREVIOUS_REVISION');
 
             if ($revert) {
-
                 if (!isset($previousRevision)) {
                     throw new Exception("Could not find previous revision in {$server['host']}, which means that reverting is not possible.");
                 }
@@ -382,5 +362,27 @@ class Terra_Git {
             ftp_close($connection);
         }
     }
+    
+    
+    /**
+     * Get content of remote revision file.
+     * @param ftp_handle
+     * @param string $filename
+     * @return string
+     */
+    function getRemoteRevisionContent($connection, $filename = 'REVISION')
+    {
+        $tmpFile = tmpfile();
+        $ret = NULL;
 
+        if (@ftp_fget($connection, $tmpFile, $filename, FTP_ASCII)) {
+            fseek($tmpFile, 0);
+            $ret = trim(fread($tmpFile, 1024));
+            fclose($tmpFile);
+        } else {
+            # Couldn't get the file. I assume it's because the file didn't exist.
+        }
+        
+        return $ret;
+    }
 }
