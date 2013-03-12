@@ -11,26 +11,15 @@
 define('GIT_DEPLOY_DIR', __DIR__ . '/.gitdeploy');
 ini_set('max_execution_time', 0);
 
-$commands = array('-l', '-r', '--revert');
-
-if (isset($argv[1])) {
-    if (!in_array($argv[1], $commands)) {
-        $deploy = $argv[1] . '.ini';
-    } else {
-        $deploy = 'deploy.ini';
-    }
-} else {
-    $deploy = 'deploy.ini';
-}
-
-$deploy = GIT_DEPLOY_DIR . '/' . $deploy;
-
-$opts = getopt("lr:", array("revert"));
-
+$opts = getopt("lr:", array("revert", 'env:'));
 $list = isset($opts['l']);
 $revision = isset($opts['r']) ? $opts['r'] : 'HEAD';
-
 $revert = isset($opts['revert']);
+$deploy = isset($opts['env']) ? $opts['env'] : 'deploy.ini';
+$deploy = GIT_DEPLOY_DIR . '/' . $deploy;
+if (substr($deploy, -4) !== '.ini') {
+    $deploy .= '.ini';
+}
 
 
 /**
