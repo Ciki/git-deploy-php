@@ -51,17 +51,21 @@ try {
             $remoteRevision = NULL;
         }
         $files = $git->getFilesToUpload($remoteRevision, $revision);
-        if (count($files['upload']) > 0) {
-            $git->output("Files to upload:");
-            foreach ($files['upload'] as $fileToUpload) {
-                $git->output($fileToUpload);
+        if (count($files['upload']) === 0 && count($files['delete']) === 0) {
+            $git->output('No files to upload or delete.');
+        } else {
+            if (count($files['upload']) > 0) {
+                $git->output("Files to upload:");
+                foreach ($files['upload'] as $fileToUpload) {
+                    $git->output($fileToUpload);
+                }
             }
-        }
 
-        if (count($files['delete']) > 0) {
-            $git->output("Files to delete:");
-            foreach ($files['delete'] as $fileToDelete) {
-                $git->output($fileToDelete);
+            if (count($files['delete']) > 0) {
+                $git->output("Files to delete:");
+                foreach ($files['delete'] as $fileToDelete) {
+                    $git->output($fileToDelete);
+                }
             }
         }
     }
