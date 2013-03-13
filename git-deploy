@@ -366,7 +366,9 @@ class Terra_Git {
                     }
                 }
                 $this->output("Uploaded {$file}");
-                unlink($tmpFileToUpload);
+                if (!$isFirstTimeDeploy) {
+                    unlink($tmpFileToUpload);
+                }
             }
 
             foreach ($filesToDelete as $file) {
