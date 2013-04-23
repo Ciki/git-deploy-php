@@ -84,6 +84,8 @@ class Terra_Git {
     protected $logFile = 'git-deploy.log.txt';
     protected $submodules = array();
     protected $servers = array();
+    protected $pathsThatExist = array();
+
 
     function __construct() {
         # Check if there are any submodules in the git repository.
@@ -185,8 +187,8 @@ class Terra_Git {
         }
 
         return array(
-            'upload' => $filesToUpload,
-            'delete' => $filesToDelete
+            'upload' => array_combine($filesToUpload, $filesToUpload),
+            'delete' => array_combine($filesToDelete, $filesToDelete),
         );
     }
 
@@ -213,6 +215,36 @@ class Terra_Git {
             $this->deployGitOverFtp($server, $revision);
         }
     }
+    
+    function ftp_mkdir($connection, $file)
+    {
+        $dir = explode('/', dirname($file));
+        $path = '';
+
+        for ($i = 0; $i < count($dir); $i++) {
+            $path .= $dir[$i] . '/';
+
+            if (!isset($this->pathsThatExist[$path])) {
+                $origin = ftp_pwd($connection);
+
+                if (!@ftp_chdir($connection, $path)) {
+                    if (!@ftp_mkdir($connection, $path)) {
+                        $this->output("Failed to create '$path'.");
+                        return false;
+                    } else {
+                        $this->output("Created directory '$path'.");
+                        $this->pathsThatExist[$path] = true;
+                    }
+                } else {
+                    $this->pathsThatExist[$path] = true;
+                }
+
+                ftp_chdir($connection, $origin);
+            }
+        }
+        
+        return true;
+    }
 
     function deployGitOverFtp($server, $revision = 'HEAD', $revert = false) {
 
@@ -225,8 +257,6 @@ class Terra_Git {
         if (substr($server['path'], -1) !== '/') {
             $server['path'] = $server['path'] . '/';
         }
-
-        $pathsThatExist = array();
 
         # Okay, let's connect to the server.
 
@@ -290,6 +320,15 @@ class Terra_Git {
             $filesToUpload = $files['upload'];
             $filesToDelete = $files['delete'];
             unset($files);
+            
+            if ($isFirstTimeDeploy) {
+                $minifiedPath = 'libs/minified'; // relative to root
+                $firstTimeDeployFiles = array(
+                    $minifiedPath . '/Nette/loader.php' => 'libs/Nette/loader.php',
+                    $minifiedPath . '/dibi.min.php' => 'libs/dibi.min.php',
+                );
+                $filesToUpload = array_merge($filesToUpload, $firstTimeDeployFiles);
+            }
 
             $maintenanceModeTurnedOn = false;
             // turn on "Maintenance mode" before uploading
@@ -305,44 +344,22 @@ class Terra_Git {
                 $maintenanceModeTurnedOn = true;
             }
             
-            foreach ($filesToUpload as $file) {
+            // most of the time $localFile === $remoteFile - $remoteFile just defines path where $localFile gets uploaded
+            foreach ($filesToUpload as $localFile => $remoteFile) {
                 # Make sure the folder exists in the FTP server.
-
-                $dir = explode("/", dirname($file));
-                $path = "";
-                $ret = true;
-
-                for ($i = 0; $i < count($dir); $i++) {
-                    $path.= $dir[$i] . '/';
-
-                    if (!isset($pathsThatExist[$path])) {
-                        $origin = ftp_pwd($connection);
-
-                        if (!@ftp_chdir($connection, $path)) {
-                            if (!@ftp_mkdir($connection, $path)) {
-                                $ret = false;
-                                $this->output("Failed to create '$path'.");
-                                $this->output("A problem occurred while attempting to create a folder. Upload to this server cannot continue.");
-                                return;
-                            } else {
-                                $this->output("Created directory '$path'.");
-                                $pathsThatExist[$path] = true;
-                            }
-                        } else {
-                            $pathsThatExist[$path] = true;
-                        }
-
-                        ftp_chdir($connection, $origin);
-                    }
+                $ret = $this->ftp_mkdir($connection, $remoteFile);
+                if ($ret === false) {
+                    $this->output("A problem occurred while attempting to create a folder. Upload to this server cannot continue.");
+                    return false;
                 }
 
                 // first time we upload files as they are (working directory is clean)
                 if ($isFirstTimeDeploy) {
-                    $tmpFileToUpload = $file;
+                    $tmpFileToUpload = $localFile;
                 // other times we upload tmp file with content of $revision
                 } else {
                     $tmpFileToUpload = GIT_DEPLOY_DIR . '/tmpFileToUpload';
-                    $command = "git show $revision:$file > $tmpFileToUpload";
+                    $command = "git show $revision:$localFile > $tmpFileToUpload";
                     $output = array();
                     exec($command, $output);
                 }
@@ -352,20 +369,20 @@ class Terra_Git {
                 while (!$uploaded) {
 
                     if ($attempts == 10) {
-                        $this->output("Tried to upload $file 10 times, and failed 10 times. Something is wrong, so I'm going to stop executing now.");
+                        $this->output("Tried to upload $localFile 10 times, and failed 10 times. Something is wrong, so I'm going to stop executing now.");
                         exit;
                     }
 
                     # This makes sure to repeat the upload until it finally succeeds.
                     # Hopefully helps fix a problem where some files aren't transferred.
-                    $uploaded = @ftp_put($connection, $file, $tmpFileToUpload, FTP_BINARY);
+                    $uploaded = @ftp_put($connection, $remoteFile, $tmpFileToUpload, FTP_BINARY);
 
                     if (!$uploaded) {
                         $attempts = $attempts + 1;
-                        $this->output("Failed to upload {$file}. Retrying (attempt $attempts/10)... ");
+                        $this->output("Failed to upload {$localFile}. Retrying (attempt $attempts/10)... ");
                     }
                 }
-                $this->output("Uploaded {$file}");
+                $this->output("Uploaded {$localFile}");
                 if (!$isFirstTimeDeploy) {
                     unlink($tmpFileToUpload);
                 }
@@ -417,7 +434,7 @@ class Terra_Git {
             if (!empty($server['file_permissions'])) {
                 $this->setFilePermissions($connection, $server['file_permissions']);
             }
-
+            
             $this->output( "----------------------------");
 
             $this->output("Finished working on {$server['host']}{$server['path']}");
