@@ -136,6 +136,7 @@ class Terra_Git {
                 'maintenancePath' => 'web/.maintenance.php',
                 'clean_directories' => array(),
                 'file_permissions' => array(),
+				'substitutions' => array(),
             ), $options);
 
             if ($options['skip']) {
@@ -150,7 +151,7 @@ class Terra_Git {
         $this->filesToIgnore[] = $file;
     }
 
-    function getFilesToUpload($oldRevision = null, $newRevision = 'HEAD') {
+    function getFilesToUpload($oldRevision = null, $newRevision = 'HEAD', $substitutions = array()) {
         # Get the list of files to update.
 
         if (!empty($oldRevision)) {
@@ -186,9 +187,17 @@ class Terra_Git {
             }
         }
 
+        if ($substitutions) {
+			$filesToUploadRemotePaths = preg_replace(array_keys($substitutions), array_values($substitutions), $filesToUpload);
+			$filesToDeleteRemotePaths = preg_replace(array_keys($substitutions), array_values($substitutions), $filesToDelete);
+		} else {
+			$filesToUploadRemotePaths = $filesToUpload;
+			$filesToDeleteRemotePaths = $filesToDelete;
+		}
+
         return array(
-            'upload' => array_combine($filesToUpload, $filesToUpload),
-            'delete' => array_combine($filesToDelete, $filesToDelete),
+            'upload' => array_combine($filesToUpload, $filesToUploadRemotePaths),
+            'delete' => array_combine($filesToDelete, $filesToDeleteRemotePaths),
         );
     }
 
@@ -201,7 +210,7 @@ class Terra_Git {
     }
 
     function __destruct() {
-        
+
     }
 
     function revert() {
@@ -215,7 +224,7 @@ class Terra_Git {
             $this->deployGitOverFtp($server, $revision);
         }
     }
-    
+
     function ftp_mkdir($connection, $file)
     {
         $dir = explode('/', dirname($file));
@@ -242,7 +251,7 @@ class Terra_Git {
                 ftp_chdir($connection, $origin);
             }
         }
-        
+
         return true;
     }
 
@@ -274,7 +283,7 @@ class Terra_Git {
             ftp_pasv($connection, $server['passive']);
 
             if (ftp_chdir($connection, $server['path'])) {
-                
+
             } else {
                 throw new Exception("Could not change the FTP directory to {$server['path']}.");
             }
@@ -316,11 +325,11 @@ class Terra_Git {
                 }
             }
 
-            $files = $this->getFilesToUpload($remoteRevision, $revision);
+            $files = $this->getFilesToUpload($remoteRevision, $revision, $server['substitutions']);
             $filesToUpload = $files['upload'];
             $filesToDelete = $files['delete'];
             unset($files);
-            
+
             if ($isFirstTimeDeploy) {
                 $minifiedPath = 'libs/minified'; // relative to root
                 $firstTimeDeployFiles = array(
@@ -343,7 +352,7 @@ class Terra_Git {
                 $this->output('Maintenance mode turned ON');
                 $maintenanceModeTurnedOn = true;
             }
-            
+
             // most of the time $localFile === $remoteFile - $remoteFile just defines path where $localFile gets uploaded
             foreach ($filesToUpload as $localFile => $remoteFile) {
                 # Make sure the folder exists in the FTP server.
@@ -399,7 +408,7 @@ class Terra_Git {
                      $this->output("Emptied {$dir}");
                  }
             }
- 
+
             if (count($filesToUpload) > 0 or count($filesToDelete) > 0) {
                 $this->output("----------------------------");
                 $temp = tempnam(sys_get_temp_dir(), 'gitRevision');
@@ -407,7 +416,7 @@ class Terra_Git {
                 ftp_put($connection, 'REVISION', $temp, FTP_BINARY);
                 unlink($temp);
                 $this->output("Uploaded REVISION file.");
-                
+
                 file_put_contents(getRemoteRevisionLocalFilepath(), $revision);
                 $this->output("Stored local REMOTE_REVISION file.");
 
@@ -423,28 +432,28 @@ class Terra_Git {
             } else {
                 $this->output("No files to upload.");
             }
-            
+
             # when uploading done turn off "Maintenance mode"
             if ($maintenanceModeTurnedOn) {
                 ftp_rename($connection, $indexPath, $maintenancePath);
                 ftp_rename($connection, $tmpIndexPath, $indexPath);
                 $this->output("Maintenance mode turned OFF");
             }
-                        
+
             if (!empty($server['file_permissions'])) {
                 $this->setFilePermissions($connection, $server['file_permissions']);
             }
-            
+
             $this->output( "----------------------------");
 
             $this->output("Finished working on {$server['host']}{$server['path']}");
-            
+
             $this->output( "----------------------------");
 
             ftp_close($connection);
         }
     }
- 
+
     /**
      * Clean (and optionally remove) whole directory recursively
      * @link http://www.php.net/manual/en/function.ftp-nlist.php#62306
@@ -492,8 +501,8 @@ class Terra_Git {
         }
         $this->output('Permissions set.');
     }
-    
-    
+
+
     /**
      * Get content of remote revision file.
      * @param ftp_handle
@@ -512,7 +521,7 @@ class Terra_Git {
         } else {
             # Couldn't get the file. I assume it's because the file didn't exist.
         }
-        
+
         return $ret;
     }
 }
