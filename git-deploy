@@ -18,9 +18,8 @@ $revert = isset($opts['revert']);
 $deploy = isset($opts['env']) ? $opts['env'] : 'deploy.ini';
 $deploy = GIT_DEPLOY_DIR . '/' . $deploy;
 if (substr($deploy, -4) !== '.ini') {
-    $deploy .= '.ini';
+	$deploy .= '.ini';
 }
-
 
 /**
  * Get local path to file containing revision deployed to server.
@@ -29,165 +28,212 @@ if (substr($deploy, -4) !== '.ini') {
  */
 function getRemoteRevisionLocalFilepath()
 {
-    global $deploy;
-    return GIT_DEPLOY_DIR . '/REMOTE_REVISION-' . basename($deploy, '.ini');
+	global $deploy;
+	return GIT_DEPLOY_DIR . '/REMOTE_REVISION-' . basename($deploy, '.ini');
+}
+
+
+function get_recursive_file_list($folder, $prefix = '')
+{
+
+	# Add trailing slash
+	$folder = (substr($folder, strlen($folder) - 1, 1) == '/') ? $folder : $folder . '/';
+
+	$return = array();
+
+	foreach (clean_scandir($folder) as $file) {
+		if (is_dir($folder . $file)) {
+			$return = array_merge($return, get_recursive_file_list($folder . $file, $prefix . $file . '/'));
+		} else {
+			$return[] = $prefix . $file;
+		}
+	}
+
+	return $return;
+}
+
+
+function clean_scandir($folder, $ignore = array())
+{
+	$ignore[] = '.';
+	$ignore[] = '..';
+	$ignore[] = '.DS_Store';
+	$return = array();
+
+	foreach (scandir($folder) as $file) {
+		if (!in_array($file, $ignore)) {
+			$return[] = $file;
+		}
+	}
+
+	return $return;
 }
 
 
 try {
-    $git = new Terra_Git();
-    if (!$list) {
-        $git->setDeployFile($deploy);
-        if ($revert) {
-            $git->revert();
-        } else {
-            $git->deploy($revision);
-        }
-    } else {
-        $remoteRevisionLocalFilePath = getRemoteRevisionLocalFilepath();
-        if (file_exists($remoteRevisionLocalFilePath)) {
-            $remoteRevision = trim(file_get_contents($remoteRevisionLocalFilePath));
-        } else {
-            $remoteRevision = NULL;
-        }
-        $files = $git->getFilesToUpload($remoteRevision, $revision);
-        if (count($files['upload']) === 0 && count($files['delete']) === 0) {
-            $git->output('No files to upload or delete.');
-        } else {
-            if (count($files['upload']) > 0) {
-                $git->output("Files to upload:");
-                foreach ($files['upload'] as $fileToUpload) {
-                    $git->output($fileToUpload);
-                }
-            }
+	$git = new Terra_Git();
+	if (!$list) {
+		$git->setDeployFile($deploy);
+		if ($revert) {
+			$git->revert();
+		} else {
+			$git->deploy($revision);
+		}
+	} else {
+		$remoteRevisionLocalFilePath = getRemoteRevisionLocalFilepath();
+		if (file_exists($remoteRevisionLocalFilePath)) {
+			$remoteRevision = trim(file_get_contents($remoteRevisionLocalFilePath));
+		} else {
+			$remoteRevision = NULL;
+		}
+		$files = $git->getFilesToUpload($remoteRevision, $revision);
+		if (count($files['upload']) === 0 && count($files['delete']) === 0) {
+			$git->output('No files to upload or delete.');
+		} else {
+			if (count($files['upload']) > 0) {
+				$git->output("Files to upload:");
+				foreach ($files['upload'] as $fileToUpload) {
+					$git->output($fileToUpload);
+				}
+			}
 
-            if (count($files['delete']) > 0) {
-                $git->output("Files to delete:");
-                foreach ($files['delete'] as $fileToDelete) {
-                    $git->output($fileToDelete);
-                }
-            }
-        }
-    }
+			if (count($files['delete']) > 0) {
+				$git->output("Files to delete:");
+				foreach ($files['delete'] as $fileToDelete) {
+					$git->output($fileToDelete);
+				}
+			}
+		}
+	}
 } catch (Exception $e) {
-    echo $e->getMessage();
+	echo $e->getMessage();
 }
 
-class Terra_Git {
+class Terra_Git
+{
+	protected $filesToIgnore = array(
+		'git-deploy',
+		'.gitignore',
+	);
+	protected $print = true;
+	protected $logBuffer = '';
+	protected $logFile = 'git-deploy.log.txt';
+	protected $submodules = array();
+	protected $servers = array();
+	protected $pathsThatExist = array();
 
-    protected $filesToIgnore = array(
-        'git-deploy',
-        '.gitignore',
-    );
-    protected $print = true;
-    protected $logBuffer = '';
-    protected $logFile = 'git-deploy.log.txt';
-    protected $submodules = array();
-    protected $servers = array();
-    protected $pathsThatExist = array();
+
+	function __construct()
+	{
+		# Check if there are any submodules in the git repository.
+
+		$command = "git submodule status";
+
+		$output = array();
+		exec($command, $output);
+
+		foreach ($output as $line) {
+			$line = explode(' ', $line);
+			$this->submodules[] = $line[1];
+		}
+	}
 
 
-    function __construct() {
-        # Check if there are any submodules in the git repository.
+	function setDeployFile($deploy)
+	{
+		if (!@file_exists($deploy)) {
+			throw new Exception("File '$deploy' does not exist.");
+		} else {
+			$servers = parse_ini_file($deploy, true);
+			if (!$servers) {
+				throw new Exception("File '$deploy' is not a valid .ini file.");
+			} else {
+				$this->addServers($servers);
+			}
+		}
+		$this->ignoreFile($deploy);
+	}
 
-        $command = "git submodule status";
 
-        $output = array();
-        exec($command, $output);
+	function addServers($servers)
+	{
+		foreach ($servers as $uri => $options) {
 
-        foreach ($output as $line) {
-            $line = explode(' ', $line);
-            $this->submodules[] = $line[1];
-        }
-    }
+			if (substr($uri, 0, 6) === 'ftp://') {
+				$options = array_merge($options, parse_url($uri));
+			}
 
-    function setDeployFile($deploy) {
-        if (!@file_exists($deploy)) {
-            throw new Exception("File '$deploy' does not exist.");
-        } else {
-            $servers = parse_ini_file($deploy, true);
-            if (!$servers) {
-                throw new Exception("File '$deploy' is not a valid .ini file.");
-            } else {
-                $this->addServers($servers);
-            }
-        }
-        $this->ignoreFile($deploy);
-    }
-
-    function addServers($servers) {
-        foreach ($servers as $uri => $options) {
-
-            if (substr($uri, 0, 6) === 'ftp://') {
-                $options = array_merge($options, parse_url($uri));
-            }
-
-            # Throw in some default values, in case they're not set.
-            $options = array_merge(array(
-                'skip' => false,
-                'host' => '',
-                'user' => '',
-                'pass' => '',
-                'port' => 21,
-                'path' => '/',
-                'passive' => true,
-                'maintenanceMode' => true,
-                'indexPath' => 'web/index.php',
-                'maintenancePath' => 'web/.maintenance.php',
-                'clean_directories' => array(),
-                'file_permissions' => array(),
+			# Throw in some default values, in case they're not set.
+			$options = array_merge(array(
+				'skip' => false,
+				'host' => '',
+				'user' => '',
+				'pass' => '',
+				'port' => 21,
+				'path' => '/',
+				'passive' => true,
+				'maintenanceMode' => true,
+				'indexPath' => 'web/index.php',
+				'maintenancePath' => 'web/.maintenance.php',
+				'clean_directories' => array(),
+				'file_permissions' => array(),
 				'substitutions' => array(),
-            ), $options);
+				'config_env' => NULL,
+				), $options);
 
-            if ($options['skip']) {
-                continue;
-            } else {
-                $this->servers[$uri] = $options;
-            }
-        }
-    }
+			if ($options['skip']) {
+				continue;
+			} else {
+				$this->servers[$uri] = $options;
+			}
+		}
+	}
 
-    function ignoreFile($file) {
-        $this->filesToIgnore[] = $file;
-    }
 
-    function getFilesToUpload($oldRevision = null, $newRevision = 'HEAD', $substitutions = array()) {
-        # Get the list of files to update.
+	function ignoreFile($file)
+	{
+		$this->filesToIgnore[] = $file;
+	}
 
-        if (!empty($oldRevision)) {
-            $command = "git diff --name-status {$oldRevision} {$newRevision}";
-        } else {
-            $command = "git ls-files";
-        }
 
-        $output = array();
-        exec($command, $output);
+	function getFilesToUpload($oldRevision = null, $newRevision = 'HEAD', $substitutions = array())
+	{
+		# Get the list of files to update.
 
-        $filesToUpload = array();
-        $filesToDelete = array();
+		if (!empty($oldRevision)) {
+			$command = "git diff --name-status {$oldRevision} {$newRevision}";
+		} else {
+			$command = "git ls-files";
+		}
 
-        if (!empty($oldRevision)) {
-            foreach ($output as $line) {
-                if ($line[0] == 'A' or $line[0] == 'C' or $line[0] == 'M') {
-                    $path = trim(substr($line, 1, strlen($line)));
-                    $filesToUpload[] = $path;
-                } elseif ($line[0] == 'D') {
-                    $filesToDelete[] = trim(substr($line, 1, strlen($line)));
-                } else {
-                    throw new Exception("Unknown git-diff status: {$line[0]}");
-                }
-            }
-        } else {
-            $filesToUpload = $output;
-        }
+		$output = array();
+		exec($command, $output);
 
-        foreach ($filesToUpload as $key => $file) {
-            if (in_array($file, $this->filesToIgnore)) {
-                unset($filesToUpload[$key]);
-            }
-        }
+		$filesToUpload = array();
+		$filesToDelete = array();
 
-        if ($substitutions) {
+		if (!empty($oldRevision)) {
+			foreach ($output as $line) {
+				if ($line[0] == 'A' or $line[0] == 'C' or $line[0] == 'M') {
+					$path = trim(substr($line, 1, strlen($line)));
+					$filesToUpload[] = $path;
+				} elseif ($line[0] == 'D') {
+					$filesToDelete[] = trim(substr($line, 1, strlen($line)));
+				} else {
+					throw new Exception("Unknown git-diff status: {$line[0]}");
+				}
+			}
+		} else {
+			$filesToUpload = $output;
+		}
+
+		foreach ($filesToUpload as $key => $file) {
+			if (in_array($file, $this->filesToIgnore)) {
+				unset($filesToUpload[$key]);
+			}
+		}
+
+		if ($substitutions) {
 			$filesToUploadRemotePaths = preg_replace(array_keys($substitutions), array_values($substitutions), $filesToUpload);
 			$filesToDeleteRemotePaths = preg_replace(array_keys($substitutions), array_values($substitutions), $filesToDelete);
 		} else {
@@ -195,333 +241,367 @@ class Terra_Git {
 			$filesToDeleteRemotePaths = $filesToDelete;
 		}
 
-        return array(
-            'upload' => array_combine($filesToUpload, $filesToUploadRemotePaths),
-            'delete' => array_combine($filesToDelete, $filesToDeleteRemotePaths),
-        );
-    }
-
-    function output($message) {
-        if ($this->print) {
-            echo $message . "\r\n";
-        } else {
-            $this->logBuffer .= $message . "\r\n";
-        }
-    }
-
-    function __destruct() {
-
-    }
-
-    function revert() {
-        foreach ($this->servers as $server) {
-            $this->deployGitOverFtp($server, 'HEAD', true);
-        }
-    }
-
-    function deploy($revision = 'HEAD') {
-        foreach ($this->servers as $server) {
-            $this->deployGitOverFtp($server, $revision);
-        }
-    }
-
-    function ftp_mkdir($connection, $file)
-    {
-        $dir = explode('/', dirname($file));
-        $path = '';
-
-        for ($i = 0; $i < count($dir); $i++) {
-            $path .= $dir[$i] . '/';
-
-            if (!isset($this->pathsThatExist[$path])) {
-                $origin = ftp_pwd($connection);
-
-                if (!@ftp_chdir($connection, $path)) {
-                    if (!@ftp_mkdir($connection, $path)) {
-                        $this->output("Failed to create '$path'.");
-                        return false;
-                    } else {
-                        $this->output("Created directory '$path'.");
-                        $this->pathsThatExist[$path] = true;
-                    }
-                } else {
-                    $this->pathsThatExist[$path] = true;
-                }
-
-                ftp_chdir($connection, $origin);
-            }
-        }
-
-        return true;
-    }
-
-    function deployGitOverFtp($server, $revision = 'HEAD', $revert = false) {
-
-        if ($revision == 'HEAD') {
-            $revision = exec('git rev-parse HEAD');
-        }
-
-        # Let's make sure the $path ends with a slash.
-
-        if (substr($server['path'], -1) !== '/') {
-            $server['path'] = $server['path'] . '/';
-        }
-
-        # Okay, let's connect to the server.
-
-        $connection = @ftp_connect($server['host'], $server['port']);
-
-        if (!$connection) {
-            throw new Exception("Could not connect to {$server['host']}.");
-        } else {
-
-            if (!@ftp_login($connection, $server['user'], $server['pass'])) {
-                throw new Exception("Could not login to {$server['host']} (Tried to login as {$server['user']}).");
-            }
+		return array(
+			'upload' => array_combine($filesToUpload, $filesToUploadRemotePaths),
+			'delete' => array_combine($filesToDelete, $filesToDeleteRemotePaths),
+		);
+	}
 
 
-            ftp_pasv($connection, $server['passive']);
-
-            if (ftp_chdir($connection, $server['path'])) {
-
-            } else {
-                throw new Exception("Could not change the FTP directory to {$server['path']}.");
-            }
-
-            $this->output(("----------------------------"));
-            $this->output("Connected to {$server['host']}{$server['path']}");
-            $this->output("----------------------------");
-
-            # Now that we're logged in to the server, let's get the remote revision.
-
-            $remoteRevision = $this->getRemoteRevisionContent($connection, 'REVISION');
-            $previousRevision = $this->getRemoteRevisionContent($connection, 'PREVIOUS_REVISION');
-            $isFirstTimeDeploy = $remoteRevision === NULL;
-            // clean working directory is required for first-time deploy to avoid massive file renaming while uploading (see below)
-            if ($isFirstTimeDeploy) {
-                $output = array();
-                exec('git status --porcelain', $output);
-                if (!empty($output)) {
-                    $this->output('First-time deployment requires clean working directory! Clean it please and retry!');
-                    exit;
-                }
-            }
-
-            if ($revert) {
-                if (!isset($previousRevision)) {
-                    throw new Exception("Could not find previous revision in {$server['host']}, which means that reverting is not possible.");
-                }
-
-                # Set revision to PREVIOUS_REVISION, for reverting.
-                $revision = $previousRevision;
-                if ($remoteRevision != $revision) {
-                    $this->output("Reverting from " . substr($remoteRevision, 0, 6) . " to " . substr($revision, 0, 6) . ".");
-                    $this->output("----------------------------");
-                }
-            } else {
-                if ($remoteRevision != $revision) {
-                    $this->output("Deploying update from " . substr($remoteRevision, 0, 6) . " to " . substr($revision, 0, 6) . ".");
-                    $this->output("----------------------------");
-                }
-            }
-
-            $files = $this->getFilesToUpload($remoteRevision, $revision, $server['substitutions']);
-            $filesToUpload = $files['upload'];
-            $filesToDelete = $files['delete'];
-            unset($files);
-
-            if ($isFirstTimeDeploy) {
-                $minifiedPath = 'libs/minified'; // relative to root
-                $firstTimeDeployFiles = array(
-                    $minifiedPath . '/Nette/loader.php' => 'libs/Nette/loader.php',
-                    $minifiedPath . '/dibi.min.php' => 'libs/dibi.min.php',
-                );
-                $filesToUpload = array_merge($filesToUpload, $firstTimeDeployFiles);
-            }
-
-            $maintenanceModeTurnedOn = false;
-            // turn on "Maintenance mode" before uploading
-            if ($server['maintenanceMode'] && !$isFirstTimeDeploy
-                && (count($filesToUpload) > 0 or count($filesToDelete) > 0)
-            ) {
-                $indexPath = $server['indexPath'];
-                $maintenancePath = $server['maintenancePath'];
-                $tmpIndexPath = $indexPath . '.tmp';
-                ftp_rename($connection, $indexPath, $tmpIndexPath);
-                ftp_rename($connection, $maintenancePath, $indexPath);
-                $this->output('Maintenance mode turned ON');
-                $maintenanceModeTurnedOn = true;
-            }
-
-            // most of the time $localFile === $remoteFile - $remoteFile just defines path where $localFile gets uploaded
-            foreach ($filesToUpload as $localFile => $remoteFile) {
-                # Make sure the folder exists in the FTP server.
-                $ret = $this->ftp_mkdir($connection, $remoteFile);
-                if ($ret === false) {
-                    $this->output("A problem occurred while attempting to create a folder. Upload to this server cannot continue.");
-                    return false;
-                }
-
-                // first time we upload files as they are (working directory is clean)
-                if ($isFirstTimeDeploy) {
-                    $tmpFileToUpload = $localFile;
-                // other times we upload tmp file with content of $revision
-                } else {
-                    $tmpFileToUpload = GIT_DEPLOY_DIR . '/tmpFileToUpload';
-                    $command = "git show $revision:$localFile > $tmpFileToUpload";
-                    $output = array();
-                    exec($command, $output);
-                }
-
-                $uploaded = false;
-                $attempts = 1;
-                while (!$uploaded) {
-
-                    if ($attempts == 10) {
-                        $this->output("Tried to upload $localFile 10 times, and failed 10 times. Something is wrong, so I'm going to stop executing now.");
-                        exit;
-                    }
-
-                    # This makes sure to repeat the upload until it finally succeeds.
-                    # Hopefully helps fix a problem where some files aren't transferred.
-                    $uploaded = @ftp_put($connection, $remoteFile, $tmpFileToUpload, FTP_BINARY);
-
-                    if (!$uploaded) {
-                        $attempts = $attempts + 1;
-                        $this->output("Failed to upload {$localFile}. Retrying (attempt $attempts/10)... ");
-                    }
-                }
-                $this->output("Uploaded {$localFile}");
-                if (!$isFirstTimeDeploy) {
-                    unlink($tmpFileToUpload);
-                }
-            }
-
-            foreach ($filesToDelete as $file) {
-                @ftp_delete($connection, $file);
-                $this->output("Deleted {$file}");
-            }
-
-            if (!empty($server['clean_directories'])) {
-                 foreach ($server['clean_directories'] as $dir) {
-                     $this->ftp_rmdirr($connection, $dir);
-                     $this->output("Emptied {$dir}");
-                 }
-            }
-
-            if (count($filesToUpload) > 0 or count($filesToDelete) > 0) {
-                $this->output("----------------------------");
-                $temp = tempnam(sys_get_temp_dir(), 'gitRevision');
-                file_put_contents($temp, $revision);
-                ftp_put($connection, 'REVISION', $temp, FTP_BINARY);
-                unlink($temp);
-                $this->output("Uploaded REVISION file.");
-
-                file_put_contents(getRemoteRevisionLocalFilepath(), $revision);
-                $this->output("Stored local REMOTE_REVISION file.");
-
-                # Upload file containing the current revision, for reverting when necessary.
-                # But, only if the revision we're deploying is different from the one currently deployed.
-                if ($remoteRevision != $revision) {
-                    $temp = tempnam(sys_get_temp_dir(), 'gitRevision');
-                    file_put_contents($temp, $remoteRevision);
-                    ftp_put($connection, 'PREVIOUS_REVISION', $temp, FTP_BINARY);
-                    unlink($temp);
-                    $this->output("Uploaded PREVIOUS_REVISION file.");
-                }
-            } else {
-                $this->output("No files to upload.");
-            }
-
-            # when uploading done turn off "Maintenance mode"
-            if ($maintenanceModeTurnedOn) {
-                ftp_rename($connection, $indexPath, $maintenancePath);
-                ftp_rename($connection, $tmpIndexPath, $indexPath);
-                $this->output("Maintenance mode turned OFF");
-            }
-
-            if (!empty($server['file_permissions'])) {
-                $this->setFilePermissions($connection, $server['file_permissions']);
-            }
-
-            $this->output( "----------------------------");
-
-            $this->output("Finished working on {$server['host']}{$server['path']}");
-
-            $this->output( "----------------------------");
-
-            ftp_close($connection);
-        }
-    }
-
-    /**
-     * Clean (and optionally remove) whole directory recursively
-     * @link http://www.php.net/manual/en/function.ftp-nlist.php#62306
-     */
-    function ftp_rmdirr($handle, $path, $rmDir = false, $level = 1)
-    {
-        if(!@ftp_delete($handle, $path))
-        {
-            $this->output("Cleaning: $path");
-            $list = @ftp_nlist($handle, $path);
-            if(!empty($list)) {
-                foreach($list as $value) {
-                    if (substr($value, -2) === '/.' or substr($value, -3) === '/..') {
-                        continue;
-                    }
-                    $this->ftp_rmdirr($handle, $value, true, $level+1);
-                }
-            }
-        }
-
-        if ($rmDir && $level > 1) {
-            if(@ftp_rmdir($handle, $path))
-                return true;
-            else
-                return false;
-        }
-
-        return true;
-    }
+	function output($message)
+	{
+		if ($this->print) {
+			echo $message . "\r\n";
+		} else {
+			$this->logBuffer .= $message . "\r\n";
+		}
+	}
 
 
-    /**
-     * Set 0777 file permissions for $items (create them if not present)
-     * @param ftp_handle
-     * @param array of files/directories to chmod
-     */
-    function setFilePermissions($connection, $items = array())
-    {
-        $mode = 0777;
-        foreach ($items as $path) {
-            if (!@ftp_chmod($connection, $mode, $path)) {
-                ftp_mkdir($connection, $path);
-                ftp_chmod($connection, $mode, $path);
-            }
-        }
-        $this->output('Permissions set.');
-    }
+	function __destruct()
+	{
+
+	}
 
 
-    /**
-     * Get content of remote revision file.
-     * @param ftp_handle
-     * @param string $filename
-     * @return string
-     */
-    function getRemoteRevisionContent($connection, $filename = 'REVISION')
-    {
-        $tmpFile = tmpfile();
-        $ret = NULL;
+	function revert()
+	{
+		foreach ($this->servers as $server) {
+			$this->deployGitOverFtp($server, 'HEAD', true);
+		}
+	}
 
-        if (@ftp_fget($connection, $tmpFile, $filename, FTP_ASCII)) {
-            fseek($tmpFile, 0);
-            $ret = trim(fread($tmpFile, 1024));
-            fclose($tmpFile);
-        } else {
-            # Couldn't get the file. I assume it's because the file didn't exist.
-        }
 
-        return $ret;
-    }
+	function deploy($revision = 'HEAD')
+	{
+		foreach ($this->servers as $server) {
+			$this->deployGitOverFtp($server, $revision);
+		}
+	}
+
+
+	function ftp_mkdir($connection, $file)
+	{
+		$dir = explode('/', dirname($file));
+		$path = '';
+
+		for ($i = 0; $i < count($dir); $i++) {
+			$path .= $dir[$i] . '/';
+
+			if (!isset($this->pathsThatExist[$path])) {
+				$origin = ftp_pwd($connection);
+
+				if (!@ftp_chdir($connection, $path)) {
+					if (!@ftp_mkdir($connection, $path)) {
+						$this->output("Failed to create '$path'.");
+						return false;
+					} else {
+						$this->output("Created directory '$path'.");
+						$this->pathsThatExist[$path] = true;
+					}
+				} else {
+					$this->pathsThatExist[$path] = true;
+				}
+
+				ftp_chdir($connection, $origin);
+			}
+		}
+
+		return true;
+	}
+
+
+	function deployGitOverFtp($server, $revision = 'HEAD', $revert = false)
+	{
+
+		if ($revision == 'HEAD') {
+			$revision = exec('git rev-parse HEAD');
+		}
+
+		# Let's make sure the $path ends with a slash.
+
+		if (substr($server['path'], -1) !== '/') {
+			$server['path'] = $server['path'] . '/';
+		}
+
+		# Okay, let's connect to the server.
+
+		$connection = @ftp_connect($server['host'], $server['port']);
+
+		if (!$connection) {
+			throw new Exception("Could not connect to {$server['host']}.");
+		} else {
+
+			if (!@ftp_login($connection, $server['user'], $server['pass'])) {
+				throw new Exception("Could not login to {$server['host']} (Tried to login as {$server['user']}).");
+			}
+
+
+			ftp_pasv($connection, $server['passive']);
+
+			if (ftp_chdir($connection, $server['path'])) {
+
+			} else {
+				throw new Exception("Could not change the FTP directory to {$server['path']}.");
+			}
+
+			$this->output(("----------------------------"));
+			$this->output("Connected to {$server['host']}{$server['path']}");
+			$this->output("----------------------------");
+
+			# Now that we're logged in to the server, let's get the remote revision.
+
+			$remoteRevision = $this->getRemoteRevisionContent($connection, 'REVISION');
+			$previousRevision = $this->getRemoteRevisionContent($connection, 'PREVIOUS_REVISION');
+			$isFirstTimeDeploy = $remoteRevision === NULL;
+			// clean working directory is required for first-time deploy to avoid massive file renaming while uploading (see below)
+			if ($isFirstTimeDeploy) {
+				$output = array();
+				exec('git status --porcelain', $output);
+				if (!empty($output)) {
+					$this->output('First-time deployment requires clean working directory! Clean it please and retry!');
+					exit;
+				}
+			}
+
+			if ($revert) {
+				if (!isset($previousRevision)) {
+					throw new Exception("Could not find previous revision in {$server['host']}, which means that reverting is not possible.");
+				}
+
+				# Set revision to PREVIOUS_REVISION, for reverting.
+				$revision = $previousRevision;
+				if ($remoteRevision != $revision) {
+					$this->output("Reverting from " . substr($remoteRevision, 0, 6) . " to " . substr($revision, 0, 6) . ".");
+					$this->output("----------------------------");
+				}
+			} else {
+				if ($remoteRevision != $revision) {
+					$this->output("Deploying update from " . substr($remoteRevision, 0, 6) . " to " . substr($revision, 0, 6) . ".");
+					$this->output("----------------------------");
+				}
+			}
+
+			$files = $this->getFilesToUpload($remoteRevision, $revision, $server['substitutions']);
+			$filesToUpload = $files['upload'];
+			$filesToDelete = $files['delete'];
+			unset($files);
+
+			if ($isFirstTimeDeploy) {
+
+				// paths are relative to root
+				$firstTimeDeployFiles = array(
+					'vendor/others/minified/Nette/loader.php' => 'vendor/others/Nette/loader.php',
+					'vendor/others/minified/Nette/nette.phar' => 'vendor/others/Nette/nette.phar',
+					'vendor/autoload.php' => 'vendor/autoload.php',
+					'app/config/user_pass.neon' => 'app/config/user_pass.neon',
+				);
+
+				// config
+				$configEnv = $server['config_env'];
+				if (!$configEnv) {
+					$this->output('First-time deployment requires `config_env` directive set in ini file!');
+					exit;
+				}
+				$firstTimeDeployFiles["app/config/environment/config.$configEnv.neon"] = 'app/config/config.local.neon';
+				$firstTimeDeployFiles["app/config/environment/config.$configEnv-console.neon"] = 'app/config/config.local-console.neon';
+
+				// composer directory
+				$composerRelPath = 'vendor/composer/';
+				$composerPath = __DIR__ . '/' . $composerRelPath;
+				if (is_dir($composerPath)) {
+					foreach (get_recursive_file_list($composerPath, $composerRelPath) as $f) {
+						$firstTimeDeployFiles[$f] = $f;
+					}
+				}
+
+				$filesToUpload = array_merge($filesToUpload, $firstTimeDeployFiles);
+			}
+
+			$maintenanceModeTurnedOn = false;
+			// turn on "Maintenance mode" before uploading
+			if ($server['maintenanceMode'] && !$isFirstTimeDeploy && (count($filesToUpload) > 0 or count($filesToDelete) > 0)
+			) {
+				$indexPath = $server['indexPath'];
+				$maintenancePath = $server['maintenancePath'];
+				$tmpIndexPath = $indexPath . '.tmp';
+				ftp_rename($connection, $indexPath, $tmpIndexPath);
+				ftp_rename($connection, $maintenancePath, $indexPath);
+				$this->output('Maintenance mode turned ON');
+				$maintenanceModeTurnedOn = true;
+			}
+
+			// most of the time $localFile === $remoteFile - $remoteFile just defines path where $localFile gets uploaded
+			foreach ($filesToUpload as $localFile => $remoteFile) {
+				# Make sure the folder exists in the FTP server.
+				$ret = $this->ftp_mkdir($connection, $remoteFile);
+				if ($ret === false) {
+					$this->output("A problem occurred while attempting to create a folder. Upload to this server cannot continue.");
+					return false;
+				}
+
+				// first time we upload files as they are (working directory is clean)
+				if ($isFirstTimeDeploy) {
+					$tmpFileToUpload = $localFile;
+					// other times we upload tmp file with content of $revision
+				} else {
+					$tmpFileToUpload = GIT_DEPLOY_DIR . '/tmpFileToUpload';
+					$command = "git show $revision:$localFile > $tmpFileToUpload";
+					$output = array();
+					exec($command, $output);
+				}
+
+				$uploaded = false;
+				$attempts = 1;
+				while (!$uploaded) {
+
+					if ($attempts == 10) {
+						$this->output("Tried to upload $localFile 10 times, and failed 10 times. Something is wrong, so I'm going to stop executing now.");
+						exit;
+					}
+
+					# This makes sure to repeat the upload until it finally succeeds.
+					# Hopefully helps fix a problem where some files aren't transferred.
+					$uploaded = @ftp_put($connection, $remoteFile, $tmpFileToUpload, FTP_BINARY);
+
+					if (!$uploaded) {
+						$attempts = $attempts + 1;
+						$this->output("Failed to upload {$localFile}. Retrying (attempt $attempts/10)... ");
+					}
+				}
+				$this->output("Uploaded {$localFile}");
+				if (!$isFirstTimeDeploy) {
+					unlink($tmpFileToUpload);
+				}
+			}
+
+			foreach ($filesToDelete as $file) {
+				@ftp_delete($connection, $file);
+				$this->output("Deleted {$file}");
+			}
+
+			if (!empty($server['clean_directories'])) {
+				foreach ($server['clean_directories'] as $dir) {
+					$this->ftp_rmdirr($connection, $dir);
+					$this->output("Emptied {$dir}");
+				}
+			}
+
+			if (count($filesToUpload) > 0 or count($filesToDelete) > 0) {
+				$this->output("----------------------------");
+				$temp = tempnam(sys_get_temp_dir(), 'gitRevision');
+				file_put_contents($temp, $revision);
+				ftp_put($connection, 'REVISION', $temp, FTP_BINARY);
+				unlink($temp);
+				$this->output("Uploaded REVISION file.");
+
+				file_put_contents(getRemoteRevisionLocalFilepath(), $revision);
+				$this->output("Stored local REMOTE_REVISION file.");
+
+				# Upload file containing the current revision, for reverting when necessary.
+				# But, only if the revision we're deploying is different from the one currently deployed.
+				if ($remoteRevision != $revision) {
+					$temp = tempnam(sys_get_temp_dir(), 'gitRevision');
+					file_put_contents($temp, $remoteRevision);
+					ftp_put($connection, 'PREVIOUS_REVISION', $temp, FTP_BINARY);
+					unlink($temp);
+					$this->output("Uploaded PREVIOUS_REVISION file.");
+				}
+			} else {
+				$this->output("No files to upload.");
+			}
+
+			# when uploading done turn off "Maintenance mode"
+			if ($maintenanceModeTurnedOn) {
+				ftp_rename($connection, $indexPath, $maintenancePath);
+				ftp_rename($connection, $tmpIndexPath, $indexPath);
+				$this->output("Maintenance mode turned OFF");
+			}
+
+			if (!empty($server['file_permissions'])) {
+				$this->setFilePermissions($connection, $server['file_permissions']);
+			}
+
+			$this->output("----------------------------");
+
+			$this->output("Finished working on {$server['host']}{$server['path']}");
+
+			$this->output("----------------------------");
+
+			ftp_close($connection);
+		}
+	}
+
+
+	/**
+	 * Clean (and optionally remove) whole directory recursively
+	 * @link http://www.php.net/manual/en/function.ftp-nlist.php#62306
+	 */
+	function ftp_rmdirr($handle, $path, $rmDir = false, $level = 1)
+	{
+		if (!@ftp_delete($handle, $path)) {
+			$this->output("Cleaning: $path");
+			$list = @ftp_nlist($handle, $path);
+			if (!empty($list)) {
+				foreach ($list as $value) {
+					if (in_array(basename($value), ['.', '..'])) {
+						continue;
+					}
+					$this->ftp_rmdirr($handle, $value, true, $level + 1);
+				}
+			}
+		}
+
+		if ($rmDir && $level > 1) {
+			if (@ftp_rmdir($handle, $path))
+				return true;
+			else
+				return false;
+		}
+
+		return true;
+	}
+
+
+	/**
+	 * Set 0777 file permissions for $items (create them if not present)
+	 * @param ftp_handle
+	 * @param array of files/directories to chmod
+	 */
+	function setFilePermissions($connection, $items = array())
+	{
+		$mode = 0777;
+		foreach ($items as $path) {
+			if (!@ftp_chmod($connection, $mode, $path)) {
+				ftp_mkdir($connection, $path);
+				ftp_chmod($connection, $mode, $path);
+			}
+		}
+		$this->output('Permissions set.');
+	}
+
+
+	/**
+	 * Get content of remote revision file.
+	 * @param ftp_handle
+	 * @param string $filename
+	 * @return string
+	 */
+	function getRemoteRevisionContent($connection, $filename = 'REVISION')
+	{
+		$tmpFile = tmpfile();
+		$ret = NULL;
+
+		if (@ftp_fget($connection, $tmpFile, $filename, FTP_ASCII)) {
+			fseek($tmpFile, 0);
+			$ret = trim(fread($tmpFile, 1024));
+			fclose($tmpFile);
+		} else {
+			# Couldn't get the file. I assume it's because the file didn't exist.
+		}
+
+		return $ret;
+	}
+
+
 }
