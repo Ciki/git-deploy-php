@@ -178,7 +178,6 @@ class Terra_Git
 				'clean_directories' => array(),
 				'file_permissions' => array(),
 				'substitutions' => array(),
-				'config_env' => NULL,
 				), $options);
 
 			if ($options['skip']) {
@@ -396,15 +395,6 @@ class Terra_Git
 					'vendor/autoload.php' => 'vendor/autoload.php',
 					'app/config/user_pass.neon' => 'app/config/user_pass.neon',
 				);
-
-				// config
-				$configEnv = $server['config_env'];
-				if (!$configEnv) {
-					$this->output('First-time deployment requires `config_env` directive set in ini file!');
-					exit;
-				}
-				$firstTimeDeployFiles["app/config/environment/config.$configEnv.neon"] = 'app/config/config.local.neon';
-				$firstTimeDeployFiles["app/config/environment/config.$configEnv-console.neon"] = 'app/config/config.local-console.neon';
 
 				// composer directory
 				$composerRelPath = 'vendor/composer/';
