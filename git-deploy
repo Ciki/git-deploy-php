@@ -414,8 +414,8 @@ class Terra_Git
 					'app/config/user_pass.neon' => 'app/config/user_pass.neon',
 				);
 
-				// directories to upload [composer-managed, bower-managed]
-				$dirs = ['vendor/', 'web/libs/'];
+				// upload composer-managed packages
+				$dirs = ['vendor/'];
 				foreach ($dirs as $relPath) {
 					$absPath = __DIR__ . '/' . $relPath;
 					if (is_dir($absPath)) {
