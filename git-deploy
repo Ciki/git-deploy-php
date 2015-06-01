@@ -390,18 +390,20 @@ class Terra_Git
 
 				// paths are relative to root
 				$firstTimeDeployFiles = array(
-					'vendor/others/minified/Nette/loader.php' => 'vendor/others/Nette/loader.php',
-					'vendor/others/minified/Nette/nette.phar' => 'vendor/others/Nette/nette.phar',
-					'vendor/autoload.php' => 'vendor/autoload.php',
 					'app/config/user_pass.neon' => 'app/config/user_pass.neon',
 				);
 
-				// composer directory
-				$composerRelPath = 'vendor/composer/';
-				$composerPath = __DIR__ . '/' . $composerRelPath;
-				if (is_dir($composerPath)) {
-					foreach (get_recursive_file_list($composerPath, $composerRelPath) as $f) {
-						$firstTimeDeployFiles[$f] = $f;
+				// directories to upload
+				$dirs = ['vendor/', 'web/libs/'];
+				foreach ($dirs as $relPath) {
+					$absPath = __DIR__ . '/' . $relPath;
+					if (is_dir($absPath)) {
+						foreach (get_recursive_file_list($absPath, $relPath) as $f) {
+							// skip git-tracked vendor/others directory
+							if (strpos($f, 'vendor/others/') !== 0) {
+								$firstTimeDeployFiles[$f] = $f;
+							}
+						}
 					}
 				}
 
