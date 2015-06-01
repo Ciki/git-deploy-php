@@ -1,0 +1,5 @@
+{
+	"name": "Ciki/git-deploy-php",
+	"description": "PHP script to upload git-tracked files to FTP",
+	"homepage": "https://github.com/Ciki/git-deploy-php"
+}
