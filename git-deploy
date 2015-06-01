@@ -493,6 +493,8 @@ class Terra_Git
 				$indexPath = $server['indexPath'];
 				$maintenancePath = $server['maintenancePath'];
 				$tmpIndexPath = $indexPath . '.tmp';
+				// alternatively we could just ftp_put index.php to index.php.tmp to avoid possible error of missing index.php file
+				// after indexPath renamed to tmpIndexPath but maintenancePath not yet renamed to indexPath
 				ftp_rename($connection, $indexPath, $tmpIndexPath);
 				ftp_rename($connection, $maintenancePath, $indexPath);
 				$this->output('Maintenance mode turned ON');
