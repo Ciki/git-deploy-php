@@ -433,11 +433,27 @@ class Terra_Git
 				// check if composer-managed libs have changed
 				// we handle only new/updated libraries (to upload), not removed ones (to remove)
 				$composerChangedFiles = [];
-				if (file_exists($composerLockPath)) {
+				if (isset($filesToUpload['composer.lock'])) {
 					if (!file_exists($envComposerLockPath)) {
 						throw new Exception('Env-specific composer.lock file is missing -> cannot update composer-managed files');
 					}
-					$localComposerLockJson = json_decode(file_get_contents($composerLockPath));
+					if (!file_exists($composerLockPath)) {
+						throw new Exception('`composer.lock` file is missing -> cannot update composer-managed files');
+					}
+
+					// load versioned composer.lock
+					$command = "git show $revision:composer.lock";
+					$output = array();
+					exec($command, $output);
+					$localComposerLockJson = json_decode(join('', $output));
+
+					$workingLocalComposerLockJson = json_decode(file_get_contents($composerLockPath));
+					if ($workingLocalComposerLockJson->hash !== $localComposerLockJson->hash) {
+						$this->output('There are uncommitted changes in `composer.lock` file so it is not safe to deploy now (we could upload packages with other versions than those in composer.lock'
+							. "\nPlease commit it and try again.");
+						exit;
+					}
+
 					$deployedComposerLockJson = json_decode(file_get_contents($envComposerLockPath));
 					$localPackages = $localComposerLockJson->packages;
 					$deployedPackages = $deployedComposerLockJson->packages;
