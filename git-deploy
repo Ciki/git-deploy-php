@@ -190,6 +190,7 @@ class Terra_Git
 				'maintenanceMode' => true,
 				'indexPath' => 'web/index.php',
 				'maintenancePath' => 'web/.maintenance.php',
+				'gitDeployDirectory' => '',
 				'clean_directories' => array(),
 				'file_permissions' => array(),
 				'substitutions' => array(),
@@ -211,8 +212,30 @@ class Terra_Git
 	}
 
 
-	function getFilesToUpload($oldRevision = null, $newRevision = 'HEAD', $substitutions = array())
+	/**
+	 * Filter out ignored files & files not placed inside gitDeployDirectory if not empty.
+	 * @param array $files
+	 * @param string $gitDeployDir
+	 * @return array
+	 */
+	function filterFiles($files, $gitDeployDir)
 	{
+		foreach ($files as $key => $file) {
+			if (in_array($file, $this->filesToIgnore)
+				// exclude all but gitDeployDirectory files
+				|| !empty($gitDeployDir && strpos($file, $gitDeployDir) !== 0)
+			) {
+				unset($files[$key]);
+			}
+		}
+		return $files;
+	}
+
+
+	function getFilesToUpload($oldRevision = null, $newRevision = 'HEAD', $serverOptions = [])
+	{
+		$gitDeployDir = $serverOptions['gitDeployDirectory'];
+
 		# Get the list of files to update.
 
 		if (!empty($oldRevision)) {
@@ -229,11 +252,11 @@ class Terra_Git
 
 		if (!empty($oldRevision)) {
 			foreach ($output as $line) {
+				$path = trim(substr($line, 1, strlen($line)));
 				if ($line[0] == 'A' or $line[0] == 'C' or $line[0] == 'M') {
-					$path = trim(substr($line, 1, strlen($line)));
 					$filesToUpload[] = $path;
 				} elseif ($line[0] == 'D') {
-					$filesToDelete[] = trim(substr($line, 1, strlen($line)));
+					$filesToDelete[] = $path;
 				} else {
 					throw new Exception("Unknown git-diff status: {$line[0]}");
 				}
@@ -242,12 +265,10 @@ class Terra_Git
 			$filesToUpload = $output;
 		}
 
-		foreach ($filesToUpload as $key => $file) {
-			if (in_array($file, $this->filesToIgnore)) {
-				unset($filesToUpload[$key]);
-			}
-		}
+		$filesToUpload = $this->filterFiles($filesToUpload, $gitDeployDir);
+		$filesToDelete = $this->filterFiles($filesToDelete, $gitDeployDir);
 
+		$substitutions = $serverOptions['substitutions'];
 		if ($substitutions) {
 			$filesToUploadRemotePaths = preg_replace(array_keys($substitutions), array_values($substitutions), $filesToUpload);
 			$filesToDeleteRemotePaths = preg_replace(array_keys($substitutions), array_values($substitutions), $filesToDelete);
@@ -399,7 +420,7 @@ class Terra_Git
 				}
 			}
 
-			$files = $this->getFilesToUpload($remoteRevision, $revision, $server['substitutions']);
+			$files = $this->getFilesToUpload($remoteRevision, $revision, $server);
 			$filesToUpload = $files['upload'];
 			$filesToDelete = $files['delete'];
 			unset($files);
