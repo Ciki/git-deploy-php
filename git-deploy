@@ -527,7 +527,8 @@ class Terra_Git
 				}
 
 				// first time we upload files as they are (working directory is clean)
-				if ($isFirstTimeDeploy) {
+				// same for composerChangedFiles as they are not tracked with git
+				if ($isFirstTimeDeploy || isset($composerChangedFiles[$localFile])) {
 					$tmpFileToUpload = $localFile;
 					// other times we upload tmp file with content of $revision
 				} else {
