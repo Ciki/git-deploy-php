@@ -101,7 +101,10 @@ try {
 		} else {
 			$remoteRevision = NULL;
 		}
-		$files = $git->getFilesToUpload($remoteRevision, $revision);
+		$git->setDeployFile($deploy);
+		$servers = $git->getServers();
+		$serverOptions = reset($servers);
+		$files = $git->getFilesToUpload($remoteRevision, $revision, $serverOptions);
 		if (count($files['upload']) === 0 && count($files['delete']) === 0) {
 			$git->output('No files to upload or delete.');
 		} else {
@@ -167,6 +170,15 @@ class Terra_Git
 			}
 		}
 		$this->ignoreFile($deploy);
+	}
+
+
+	/**
+	 * @return array
+	 */
+	function getServers()
+	{
+		return $this->servers;
 	}
 
 
