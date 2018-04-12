@@ -484,7 +484,7 @@ class Terra_Git
 //				var_dump($localComposerLockJson);die;
 
 					$workingLocalComposerLockJson = json_decode(file_get_contents($composerLockPath));
-					if ($workingLocalComposerLockJson->hash !== $localComposerLockJson->hash) {
+					if ($workingLocalComposerLockJson->{'content-hash'} !== $localComposerLockJson->{'content-hash'}) {
 						$this->output('There are uncommitted changes in `composer.lock` file so it is not safe to deploy now (we could upload packages with other versions than those in composer.lock'
 							. "\nPlease commit it and try again.");
 						exit;
@@ -493,7 +493,7 @@ class Terra_Git
 					$deployedComposerLockJson = json_decode(file_get_contents($envComposerLockPath));
 					$localPackages = $localComposerLockJson->packages;
 					$deployedPackages = $deployedComposerLockJson->packages;
-					if ($localComposerLockJson->hash !== $deployedComposerLockJson->hash) {
+					if ($localComposerLockJson->{'content-hash'} !== $deployedComposerLockJson->{'content-hash'}) {
 
 						/**
 						 * Has package version changed?
