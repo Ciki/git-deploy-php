@@ -105,6 +105,7 @@ try {
 		$servers = $git->getServers();
 		$serverOptions = reset($servers);
 		$files = $git->getFilesToUpload($remoteRevision, $revision, $serverOptions);
+		$git->output("Update from $remoteRevision to $revision");
 		if (count($files['upload']) === 0 && count($files['delete']) === 0) {
 			$git->output('No files to upload or delete.');
 		} else {
