@@ -270,6 +270,11 @@ class Terra_Git
 					$filesToUpload[] = $path;
 				} elseif ($line[0] == 'D') {
 					$filesToDelete[] = $path;
+					// rename, score 100
+				} elseif (substr($line, 0, 4) === 'R100') {
+					$chunks = explode("\t", $line);
+					$filesToDelete[] = $chunks[1];
+					$filesToUpload[] = $chunks[2];
 				} else {
 					throw new Exception("Unknown git-diff status: {$line[0]}");
 				}
