@@ -271,7 +271,7 @@ class Terra_Git
 				} elseif ($line[0] == 'D') {
 					$filesToDelete[] = $path;
 					// rename, score 100
-				} elseif (substr($line, 0, 4) === 'R100') {
+				} elseif ($line[0] == 'R') {
 					$chunks = explode("\t", $line);
 					$filesToDelete[] = $chunks[1];
 					$filesToUpload[] = $chunks[2];
