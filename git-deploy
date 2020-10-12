@@ -253,7 +253,7 @@ class Terra_Git
 		# Get the list of files to update.
 
 		if (!empty($oldRevision)) {
-			$command = "git diff --name-status --no-renames {$oldRevision} {$newRevision}";
+			$command = "git diff --name-status {$oldRevision} {$newRevision}";
 		} else {
 			$command = "git ls-files";
 		}
