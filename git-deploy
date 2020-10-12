@@ -208,6 +208,7 @@ class Terra_Git
 				'file_permissions' => array(),
 				'substitutions' => array(),
 				'env' => $env,
+				'uploadComposerLibs' => false,
 				), $options);
 
 			if ($options['skip']) {
@@ -453,6 +454,7 @@ class Terra_Git
 					'app/config/user_pass.neon' => 'app/config/user_pass.neon',
 				);
 
+				if ($server['uploadComposerLibs']) {
 				// upload composer-managed packages
 				$dirs = ['vendor/'];
 				foreach ($dirs as $relPath) {
@@ -465,6 +467,7 @@ class Terra_Git
 							}
 						}
 					}
+				}
 				}
 
 				$filesToUpload = array_merge($filesToUpload, $firstTimeDeployFiles);
@@ -500,6 +503,9 @@ class Terra_Git
 					$deployedPackages = $deployedComposerLockJson->packages;
 					if ($localComposerLockJson->{'content-hash'} !== $deployedComposerLockJson->{'content-hash'}) {
 
+						if (!$server['uploadComposerLibs']) {
+							$this->output('A change in composer managed libraries detected..Please run `composer install` on server.');
+						} else {
 						/**
 						 * Has package version changed?
 						 * @param string $name package name
@@ -537,6 +543,7 @@ class Terra_Git
 						}
 
 						$filesToUpload = array_merge($filesToUpload, $composerChangedFiles);
+						}
 					} else {
 						$this->output('No change in composer managed libraries detected..');
 					}
