@@ -12,7 +12,7 @@ define('GIT_DEPLOY_DIR', __DIR__ . '/.gitdeploy');
 define('VENDOR_DIR', __DIR__ . '/vendor');
 ini_set('max_execution_time', 0);
 
-$opts = getopt("lr:", array("revert", 'env:'));
+$opts = getopt("lr:", ["revert", 'env:']);
 $list = isset($opts['l']);
 $revision = isset($opts['r']) ? $opts['r'] : 'HEAD';
 $revert = isset($opts['revert']);
@@ -54,7 +54,7 @@ function get_recursive_file_list($folder, $prefix = '')
 	# Add trailing slash
 	$folder = (substr($folder, strlen($folder) - 1, 1) == '/') ? $folder : $folder . '/';
 
-	$return = array();
+	$return = [];
 
 	foreach (clean_scandir($folder) as $file) {
 		if (is_dir($folder . $file)) {
@@ -68,12 +68,12 @@ function get_recursive_file_list($folder, $prefix = '')
 }
 
 
-function clean_scandir($folder, $ignore = array())
+function clean_scandir($folder, $ignore = [])
 {
 	$ignore[] = '.';
 	$ignore[] = '..';
 	$ignore[] = '.DS_Store';
-	$return = array();
+	$return = [];
 
 	foreach (scandir($folder) as $file) {
 		if (!in_array($file, $ignore)) {
@@ -130,16 +130,16 @@ try {
 
 class Terra_Git
 {
-	protected $filesToIgnore = array(
+	protected $filesToIgnore = [
 		'git-deploy',
 		'.gitignore',
-	);
+	];
 	protected $print = true;
 	protected $logBuffer = '';
 	protected $logFile = 'git-deploy.log.txt';
-	protected $submodules = array();
-	protected $servers = array();
-	protected $pathsThatExist = array();
+	protected $submodules = [];
+	protected $servers = [];
+	protected $pathsThatExist = [];
 
 
 	function __construct()
@@ -148,7 +148,7 @@ class Terra_Git
 
 		$command = "git submodule status";
 
-		$output = array();
+		$output = [];
 		exec($command, $output);
 
 		foreach ($output as $line) {
@@ -192,7 +192,7 @@ class Terra_Git
 			}
 
 			# Throw in some default values, in case they're not set.
-			$options = array_merge(array(
+			$options = array_merge([
 				'skip' => false,
 				'host' => '',
 				'user' => '',
@@ -204,12 +204,12 @@ class Terra_Git
 				'indexPath' => 'web/index.php',
 				'maintenancePath' => 'web/.maintenance.php',
 				'gitDeployDirectory' => '',
-				'clean_directories' => array(),
-				'file_permissions' => array(),
-				'substitutions' => array(),
+				'clean_directories' => [],
+				'file_permissions' => [],
+				'substitutions' => [],
 				'env' => $env,
 				'uploadComposerLibs' => false,
-				), $options);
+				], $options);
 
 			if ($options['skip']) {
 				continue;
@@ -258,11 +258,11 @@ class Terra_Git
 			$command = "git ls-files";
 		}
 
-		$output = array();
+		$output = [];
 		exec($command, $output);
 
-		$filesToUpload = array();
-		$filesToDelete = array();
+		$filesToUpload = [];
+		$filesToDelete = [];
 
 		if (!empty($oldRevision)) {
 			foreach ($output as $line) {
@@ -296,10 +296,10 @@ class Terra_Git
 			$filesToDeleteRemotePaths = $filesToDelete;
 		}
 
-		return array(
+		return [
 			'upload' => array_combine($filesToUpload, $filesToUploadRemotePaths),
 			'delete' => array_combine($filesToDelete, $filesToDeleteRemotePaths),
-		);
+		];
 	}
 
 
@@ -411,7 +411,7 @@ class Terra_Git
 			$isFirstTimeDeploy = $remoteRevision === NULL;
 			// clean working directory is required for first-time deploy to avoid massive file renaming while uploading (see below)
 			if ($isFirstTimeDeploy) {
-				$output = array();
+				$output = [];
 				exec('git status --porcelain', $output);
 				if (!empty($output)) {
 					$this->output('First-time deployment requires clean working directory! Clean it please and retry!');
@@ -450,24 +450,24 @@ class Terra_Git
 			if ($isFirstTimeDeploy) {
 
 				// paths are relative to root
-				$firstTimeDeployFiles = array(
+				$firstTimeDeployFiles = [
 					'app/config/user_pass.neon' => 'app/config/user_pass.neon',
-				);
+				];
 
 				if ($server['uploadComposerLibs']) {
-				// upload composer-managed packages
-				$dirs = ['vendor/'];
-				foreach ($dirs as $relPath) {
-					$absPath = __DIR__ . '/' . $relPath;
-					if (is_dir($absPath)) {
-						foreach (get_recursive_file_list($absPath, $relPath) as $f) {
-							// skip git-tracked vendor/others directory
-							if (strpos($f, 'vendor/others/') !== 0) {
-								$firstTimeDeployFiles[$f] = $f;
+					// upload composer-managed packages
+					$dirs = ['vendor/'];
+					foreach ($dirs as $relPath) {
+						$absPath = __DIR__ . '/' . $relPath;
+						if (is_dir($absPath)) {
+							foreach (get_recursive_file_list($absPath, $relPath) as $f) {
+								// skip git-tracked vendor/others directory
+								if (strpos($f, 'vendor/others/') !== 0) {
+									$firstTimeDeployFiles[$f] = $f;
+								}
 							}
 						}
 					}
-				}
 				}
 
 				$filesToUpload = array_merge($filesToUpload, $firstTimeDeployFiles);
@@ -486,7 +486,7 @@ class Terra_Git
 
 					// load versioned composer.lock
 					$command = "git show $revision:$composerLockFileName";
-					$output = array();
+					$output = [];
 					exec($command, $output);
 					$localComposerLockJson = json_decode(join('', $output));
 //				var_dump($localComposerLockJson);die;
@@ -506,43 +506,43 @@ class Terra_Git
 						if (!$server['uploadComposerLibs']) {
 							$this->output('A change in composer managed libraries detected..Please run `composer install` on server.');
 						} else {
-						/**
-						 * Has package version changed?
-						 * @param string $name package name
-						 * @param string $version current package version
-						 * @param string $deployedVersion deployed package version to be set
-						 * @return bool
-						 */
-						$hasPackageChanged = function($name, $version, &$deployedVersion = NULL) use ($deployedPackages) {
-							foreach ($deployedPackages as $p) {
-								if ($p->name === $name) {
-									$deployedVersion = $p->version;
-									if ($p->version === $version) {
-										return false;
+							/**
+							 * Has package version changed?
+							 * @param string $name package name
+							 * @param string $version current package version
+							 * @param string $deployedVersion deployed package version to be set
+							 * @return bool
+							 */
+							$hasPackageChanged = function($name, $version, &$deployedVersion = NULL) use ($deployedPackages) {
+								foreach ($deployedPackages as $p) {
+									if ($p->name === $name) {
+										$deployedVersion = $p->version;
+										if ($p->version === $version) {
+											return false;
+										}
 									}
 								}
+								return true;
+							};
+
+							$composerLibChanged = false;
+							foreach ($localComposerLockJson->packages as $p) {
+								$deployedVersion = NULL;
+								if ($hasPackageChanged($p->name, $p->version, $deployedVersion)) {
+									$composerLibChanged = true;
+									addFilesFromDirectory('vendor/' . $p->name . '/', $composerChangedFiles);
+
+									$this->output("Composer: <$p->name> changed from <$deployedVersion> to <$p->version>");
+								}
 							}
-							return true;
-						};
 
-						$composerLibChanged = false;
-						foreach ($localComposerLockJson->packages as $p) {
-							$deployedVersion = NULL;
-							if ($hasPackageChanged($p->name, $p->version, $deployedVersion)) {
-								$composerLibChanged = true;
-								addFilesFromDirectory('vendor/' . $p->name . '/', $composerChangedFiles);
-
-								$this->output("Composer: <$p->name> changed from <$deployedVersion> to <$p->version>");
+							// if changed, copy composer/ & autoload.php
+							if ($composerLibChanged) {
+								addFilesFromDirectory('vendor/composer/', $composerChangedFiles);
+								$composerChangedFiles['vendor/autoload.php'] = 'vendor/autoload.php';
 							}
-						}
 
-						// if changed, copy composer/ & autoload.php
-						if ($composerLibChanged) {
-							addFilesFromDirectory('vendor/composer/', $composerChangedFiles);
-							$composerChangedFiles['vendor/autoload.php'] = 'vendor/autoload.php';
-						}
-
-						$filesToUpload = array_merge($filesToUpload, $composerChangedFiles);
+							$filesToUpload = array_merge($filesToUpload, $composerChangedFiles);
 						}
 					} else {
 						$this->output('No change in composer managed libraries detected..');
@@ -584,7 +584,7 @@ class Terra_Git
 					$unlinkTmpFile = TRUE;
 					$tmpFileToUpload = GIT_DEPLOY_DIR . '/tmpFileToUpload';
 					$command = "git show $revision:$localFile > $tmpFileToUpload";
-					$output = array();
+					$output = [];
 					exec($command, $output);
 				}
 
@@ -716,7 +716,7 @@ class Terra_Git
 	 * @param ftp_handle
 	 * @param array of files/directories to chmod
 	 */
-	function setFilePermissions($connection, $items = array())
+	function setFilePermissions($connection, $items = [])
 	{
 		$mode = 0777;
 		foreach ($items as $path) {
