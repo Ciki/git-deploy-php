@@ -592,7 +592,10 @@ class Terra_Git
 
 					# This makes sure to repeat the upload until it finally succeeds.
 					# Hopefully helps fix a problem where some files aren't transferred.
-					$uploaded = @ftp_put($connection, $remoteFile, $tmpFileToUpload, FTP_BINARY);
+					# Transfer js [& css] files using ASCII mode for proper end lines for Packer to work properly until the Packer fix https://github.com/tholu/php-packer/issues/15
+					$ext = strtolower(pathinfo($remoteFile, PATHINFO_EXTENSION));
+					$ftpMode = in_array($ext, ['js', /*'css', 'html', 'latte', 'php'*/]) ? FTP_ASCII : FTP_BINARY;
+					$uploaded = @ftp_put($connection, $remoteFile, $tmpFileToUpload, $ftpMode);
 
 					if (!$uploaded) {
 						$attempts = $attempts + 1;
@@ -623,7 +626,7 @@ class Terra_Git
 				$this->output("----------------------------");
 				$temp = tempnam(sys_get_temp_dir(), 'gitRevision');
 				file_put_contents($temp, $revision);
-				ftp_put($connection, 'REVISION', $temp, FTP_BINARY);
+				ftp_put($connection, 'REVISION', $temp, FTP_ASCII);
 				unlink($temp);
 				$this->output("Uploaded REVISION file.");
 
@@ -635,7 +638,7 @@ class Terra_Git
 				if ($remoteRevision != $revision) {
 					$temp = tempnam(sys_get_temp_dir(), 'gitRevision');
 					file_put_contents($temp, $remoteRevision);
-					ftp_put($connection, 'PREVIOUS_REVISION', $temp, FTP_BINARY);
+					ftp_put($connection, 'PREVIOUS_REVISION', $temp, FTP_ASCII);
 					unlink($temp);
 					$this->output("Uploaded PREVIOUS_REVISION file.");
 				}
