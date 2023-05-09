@@ -39,7 +39,7 @@ function getRemoteRevisionLocalFilepath(): string
  * @param string $relPath
  * @param array $arr Array to put file list to
  */
-function addFilesFromDirectory(string $relPath, array & $arr): void
+function addFilesFromDirectory(string $relPath, array &$arr): void
 {
 	$absPath = __DIR__ . '/' . $relPath;
 	foreach (get_recursive_file_list($absPath, $relPath) as $f) {
@@ -202,11 +202,12 @@ class Terra_Git
 				'maintenancePath' => 'web/.maintenance.php',
 				'gitDeployDirectory' => '',
 				'clean_directories' => [],
+				'after' => [],
 				'file_permissions' => [],
 				'substitutions' => [],
 				'env' => $env,
 				'uploadComposerLibs' => false,
-				], $options);
+			], $options);
 
 			if ($options['skip']) {
 				continue;
@@ -232,7 +233,8 @@ class Terra_Git
 	function filterFiles(array $files, string $gitDeployDir): array
 	{
 		foreach ($files as $key => $file) {
-			if (in_array($file, $this->filesToIgnore)
+			if (
+				in_array($file, $this->filesToIgnore)
 				// exclude all but gitDeployDirectory files
 				|| !empty($gitDeployDir && strpos($file, $gitDeployDir) !== 0)
 			) {
@@ -312,7 +314,6 @@ class Terra_Git
 
 	function __destruct()
 	{
-
 	}
 
 
@@ -392,7 +393,6 @@ class Terra_Git
 			ftp_pasv($connection, $server['passive']);
 
 			if (ftp_chdir($connection, $server['path'])) {
-
 			} else {
 				throw new Exception("Could not change the FTP directory to {$server['path']}.");
 			}
@@ -486,7 +486,7 @@ class Terra_Git
 					$output = [];
 					exec($command, $output);
 					$localComposerLockJson = json_decode(join('', $output));
-//				var_dump($localComposerLockJson);die;
+					// var_dump($localComposerLockJson);die;
 
 					$workingLocalComposerLockJson = json_decode(file_get_contents($composerLockPath));
 					if ($workingLocalComposerLockJson->{'content-hash'} !== $localComposerLockJson->{'content-hash'}) {
@@ -510,7 +510,7 @@ class Terra_Git
 							 * @param string $deployedVersion deployed package version to be set
 							 * @return bool
 							 */
-							$hasPackageChanged = function($name, $version, &$deployedVersion = NULL) use ($deployedPackages) {
+							$hasPackageChanged = function ($name, $version, &$deployedVersion = NULL) use ($deployedPackages) {
 								foreach ($deployedPackages as $p) {
 									if ($p->name === $name) {
 										$deployedVersion = $p->version;
@@ -549,7 +549,8 @@ class Terra_Git
 
 			$maintenanceModeTurnedOn = false;
 			// turn on "Maintenance mode" before uploading
-			if ($server['maintenanceMode'] && !$isFirstTimeDeploy && (count($filesToUpload) > 0 or count($filesToDelete) > 0)
+			if (
+				$server['maintenanceMode'] && !$isFirstTimeDeploy && (count($filesToUpload) > 0 or count($filesToDelete) > 0)
 			) {
 				$indexPath = $server['indexPath'];
 				$maintenancePath = $server['maintenancePath'];
@@ -666,6 +667,13 @@ class Terra_Git
 				$this->setFilePermissions($connection, $server['file_permissions']);
 			}
 
+			if (!empty($server['after'])) {
+				foreach ($server['after'] as $url) {
+					fopen($url, 'r');
+					$this->output("$url called");
+				}
+			}
+
 			$this->output("----------------------------");
 
 			$this->output("Finished working on {$server['host']}{$server['path']}");
@@ -691,7 +699,7 @@ class Terra_Git
 					if (in_array(basename($value), ['.', '..'])) {
 						continue;
 					}
-//					$this->ftp_rmdirr($handle, $value, true, $level + 1);
+					// $this->ftp_rmdirr($handle, $value, true, $level + 1);
 					$this->ftp_rmdirr($handle, $path . '/' . basename($value), true, $level + 1);
 				}
 			}
@@ -747,6 +755,4 @@ class Terra_Git
 
 		return $ret;
 	}
-
-
 }
