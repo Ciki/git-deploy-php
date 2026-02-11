@@ -1,5 +1,10 @@
 {
-	"name": "Ciki/git-deploy-php",
+	"name": "ciki/git-deploy-php",
 	"description": "PHP script to upload git-tracked files to FTP",
-	"homepage": "https://github.com/Ciki/git-deploy-php"
+	"homepage": "https://github.com/Ciki/git-deploy-php",
+	"license": "MIT",
+	"require": {
+		"php": "^8.1",
+		"phpseclib/phpseclib": "~3.0"
+	}
 }

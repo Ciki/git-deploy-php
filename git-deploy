@@ -1,16 +1,12 @@
 #!/usr/bin/php
 <?php
-/*
- * @todo log all output in file
- * @todo command to set file
- * @todo command to set whether to print or not
- * @todo command to ignore arbitrary files
- * @todo command to update to specific revision (including previous, see issue #8)
- * @todo see if it ends in .ini, and if it does, don't append .ini
- */
 define('GIT_DEPLOY_DIR', __DIR__ . '/.gitdeploy');
 define('VENDOR_DIR', __DIR__ . '/vendor');
 ini_set('max_execution_time', 0);
+
+require_once VENDOR_DIR . '/autoload.php';
+
+use phpseclib3\Net\SFTP;
 
 $opts = getopt("lr:", ["revert", 'env:']);
 $list = isset($opts['l']);
@@ -140,6 +136,7 @@ class Terra_Git
 	protected array $submodules = [];
 	protected array $servers = [];
 	protected array $pathsThatExist = [];
+	protected string $currentPath = '';
 
 
 	function __construct()
@@ -152,8 +149,10 @@ class Terra_Git
 		exec($command, $output);
 
 		foreach ($output as $line) {
-			$line = explode(' ', $line);
-			$this->submodules[] = $line[1];
+			$line = preg_split('/\s+/', trim($line));
+			if (isset($line[1])) {
+				$this->submodules[] = $line[1];
+			}
 		}
 	}
 
@@ -184,12 +183,13 @@ class Terra_Git
 	{
 		foreach ($servers as $uri => $options) {
 
-			if (substr($uri, 0, 6) === 'ftp://') {
+			if (substr($uri, 0, 6) === 'ftp://' || substr($uri, 0, 7) === 'ftps://' || substr($uri, 0, 7) === 'sftp://') {
 				$options = array_merge($options, parse_url($uri));
 			}
 
 			# Throw in some default values, in case they're not set.
 			$options = array_merge([
+				'scheme' => 'ftp',
 				'skip' => false,
 				'host' => '',
 				'user' => '',
@@ -208,6 +208,10 @@ class Terra_Git
 				'env' => $env,
 				'uploadComposerLibs' => false,
 			], $options);
+
+			if ($options['scheme'] === 'sftp' && $options['port'] == 21) {
+				$options['port'] = 22;
+			}
 
 			if ($options['skip']) {
 				continue;
@@ -236,7 +240,7 @@ class Terra_Git
 			if (
 				in_array($file, $this->filesToIgnore)
 				// exclude all but gitDeployDirectory files
-				|| !empty($gitDeployDir && strpos($file, $gitDeployDir) !== 0)
+				|| (!empty($gitDeployDir) && strpos($file, $gitDeployDir) !== 0)
 			) {
 				unset($files[$key]);
 			}
@@ -247,10 +251,9 @@ class Terra_Git
 
 	function getFilesToUpload(?string $oldRevision = null, string $newRevision = 'HEAD', array $serverOptions = []): array
 	{
-		$gitDeployDir = $serverOptions['gitDeployDirectory'];
+		$gitDeployDir = (string)($serverOptions['gitDeployDirectory'] ?? '');
 
 		# Get the list of files to update.
-
 		if (!empty($oldRevision)) {
 			$command = "git diff --name-status {$oldRevision} {$newRevision}";
 		} else {
@@ -312,15 +315,13 @@ class Terra_Git
 	}
 
 
-	function __destruct()
-	{
-	}
+	function __destruct() {}
 
 
 	function revert(): void
 	{
 		foreach ($this->servers as $server) {
-			$this->deployGitOverFtp($server, 'HEAD', true);
+			$this->deployGit($server, 'HEAD', true);
 		}
 	}
 
@@ -328,35 +329,50 @@ class Terra_Git
 	function deploy(string $revision = 'HEAD'): void
 	{
 		foreach ($this->servers as $server) {
-			$this->deployGitOverFtp($server, $revision);
+			$this->deployGit($server, $revision);
 		}
 	}
 
 
-	function ftp_mkdir($connection, string $file): bool
+	function mkdir($connection, string $file, string $scheme): bool
 	{
-		$dir = explode('/', dirname($file));
+		$dir = explode('/', str_replace('\\', '/', dirname($file)));
 		$path = '';
 
 		for ($i = 0; $i < count($dir); $i++) {
+			if ($dir[$i] === '' || $dir[$i] === '.') continue;
 			$path .= $dir[$i] . '/';
 
 			if (!isset($this->pathsThatExist[$path])) {
-				$origin = ftp_pwd($connection);
-
-				if (!@ftp_chdir($connection, $path)) {
-					if (!@ftp_mkdir($connection, $path)) {
-						$this->output("Failed to create '$path'.");
-						return false;
-					} else {
-						$this->output("Created directory '$path'.");
-						$this->pathsThatExist[$path] = true;
+				if ($scheme === 'sftp') {
+					if (!$connection->file_exists($path)) {
+						if (!$connection->mkdir($path)) {
+							// Double check if it was created by another process
+							if (!$connection->is_dir($path)) {
+								$this->output("Failed to create '$path'.");
+								return false;
+							}
+						} else {
+							$this->output("Created directory '$path'.");
+						}
 					}
-				} else {
 					$this->pathsThatExist[$path] = true;
+				} else {
+					$origin = $this->currentPath;
+					if (!@ftp_chdir($connection, $path)) {
+						if (!@ftp_mkdir($connection, $path)) {
+							// Check if it was created by another process or already exists
+							if (!@ftp_chdir($connection, $path)) {
+								$this->output("Failed to create '$path'.");
+								return false;
+							}
+						} else {
+							$this->output("Created directory '$path'.");
+						}
+					}
+					$this->pathsThatExist[$path] = true;
+					@ftp_chdir($connection, $origin);
 				}
-
-				ftp_chdir($connection, $origin);
 			}
 		}
 
@@ -364,7 +380,7 @@ class Terra_Git
 	}
 
 
-	function deployGitOverFtp(array $server, string $revision = 'HEAD', bool $revert = false): void
+	function deployGit(array $server, string $revision = 'HEAD', bool $revert = false): void
 	{
 
 		if ($revision == 'HEAD') {
@@ -379,337 +395,396 @@ class Terra_Git
 
 		# Okay, let's connect to the server.
 
-		$connection = @ftp_connect($server['host'], $server['port']);
-
-		if (!$connection) {
-			throw new Exception("Could not connect to {$server['host']}.");
+		if ($server['scheme'] === 'sftp') {
+			$connection = new SFTP($server['host'], $server['port']);
+			if (!$connection->login($server['user'], $server['pass'])) {
+				throw new Exception("Could not login to {$server['host']} via SFTP (Tried to login as {$server['user']}).");
+			}
+			if (!$connection->chdir($server['path'])) {
+				throw new Exception("Could not change the SFTP directory to {$server['path']}.");
+			}
+			$this->currentPath = $server['path'];
 		} else {
-
-			if (!@ftp_login($connection, $server['user'], $server['pass'])) {
-				throw new Exception("Could not login to {$server['host']} (Tried to login as {$server['user']}).");
-			}
-
-
-			ftp_pasv($connection, $server['passive']);
-
-			if (ftp_chdir($connection, $server['path'])) {
+			if ($server['scheme'] === 'ftps') {
+				$connection = @ftp_ssl_connect($server['host'], $server['port']);
 			} else {
-				throw new Exception("Could not change the FTP directory to {$server['path']}.");
+				$connection = @ftp_connect($server['host'], $server['port']);
 			}
 
-			$this->output(("----------------------------"));
-			$this->output("Connected to {$server['host']}{$server['path']}");
-			$this->output("----------------------------");
+			if (!$connection) {
+				throw new Exception("Could not connect to {$server['host']}.");
+			} else {
+				if (!ftp_login($connection, $server['user'], $server['pass'])) {
+					throw new Exception("Could not login to {$server['host']} (Tried to login as {$server['user']}).");
+				}
 
-			# Now that we're logged in to the server, let's get the remote revision.
+				ftp_pasv($connection, $server['passive']);
+				ftp_set_option($connection, FTP_TIMEOUT_SEC, 300);
 
-			$remoteRevision = $this->getRemoteRevisionContent($connection, 'REVISION');
-			$previousRevision = $this->getRemoteRevisionContent($connection, 'PREVIOUS_REVISION');
-			$isFirstTimeDeploy = $remoteRevision === NULL;
-			// clean working directory is required for first-time deploy to avoid massive file renaming while uploading (see below)
-			if ($isFirstTimeDeploy) {
+				if (ftp_chdir($connection, $server['path'])) {
+					$this->currentPath = $server['path'];
+				} else {
+					throw new Exception("Could not change the FTP directory to {$server['path']}.");
+				}
+			}
+		}
+
+		$this->output(("----------------------------"));
+		$this->output("Connected to {$server['host']}{$server['path']} via " . strtoupper($server['scheme']));
+		$this->output("----------------------------");
+
+		# Now that we're logged in to the server, let's get the remote revision.
+
+		$remoteRevision = $this->getRemoteRevisionContent($connection, 'REVISION', $server['scheme']);
+		$previousRevision = $this->getRemoteRevisionContent($connection, 'PREVIOUS_REVISION', $server['scheme']);
+		$isFirstTimeDeploy = $remoteRevision === NULL;
+		// clean working directory is required for first-time deploy to avoid massive file renaming while uploading (see below)
+		if ($isFirstTimeDeploy) {
+			$output = [];
+			exec('git status --porcelain', $output);
+			if (!empty($output)) {
+				$this->output('First-time deployment requires clean working directory! Clean it please and retry!');
+				exit;
+			}
+		}
+
+		if ($revert) {
+			if (!isset($previousRevision)) {
+				throw new Exception("Could not find previous revision in {$server['host']}, which means that reverting is not possible.");
+			}
+
+			$this->output("WARNING: Composer-managed libraries will NOT be reverted!");
+
+			# Set revision to PREVIOUS_REVISION, for reverting.
+			$revision = $previousRevision;
+			if ($remoteRevision != $revision) {
+				$this->output("Reverting from " . substr($remoteRevision, 0, 6) . " to " . substr($revision, 0, 6) . ".");
+				$this->output("----------------------------");
+			}
+		} else {
+			if ($remoteRevision && $remoteRevision != $revision) {
+				$this->output("Deploying update from " . substr($remoteRevision, 0, 6) . " to " . substr($revision, 0, 6) . ".");
+				$this->output("----------------------------");
+			}
+		}
+
+		$files = $this->getFilesToUpload($remoteRevision, $revision, $server);
+		$filesToUpload = $files['upload'];
+		$filesToDelete = $files['delete'];
+		unset($files);
+
+		$composerLockPath = __DIR__ . '/composer.lock';
+		$envComposerLockPath = GIT_DEPLOY_DIR . '/' . $server['env'] . '.composer.lock';
+
+		if ($isFirstTimeDeploy) {
+
+			// paths are relative to root
+			$firstTimeDeployFiles = [
+				'app/config/user_pass.neon' => 'app/config/user_pass.neon',
+			];
+
+			if ($server['uploadComposerLibs']) {
+				// upload composer-managed packages
+				$dirs = ['vendor/'];
+				foreach ($dirs as $relPath) {
+					$absPath = __DIR__ . '/' . $relPath;
+					if (is_dir($absPath)) {
+						foreach (get_recursive_file_list($absPath, $relPath) as $f) {
+							// skip git-tracked vendor/others directory
+							if (strpos($f, 'vendor/others/') !== 0) {
+								$firstTimeDeployFiles[$f] = $f;
+							}
+						}
+					}
+				}
+			}
+
+			$filesToUpload = array_merge($filesToUpload, $firstTimeDeployFiles);
+		} else {
+			// check if composer-managed libs have changed
+			// we handle only new/updated libraries (to upload), not removed ones (to remove)
+			$composerChangedFiles = [];
+			$composerLockFileName = $server['gitDeployDirectory'] . 'composer.lock';
+			if (isset($filesToUpload[$composerLockFileName])) {
+				if (!file_exists($envComposerLockPath)) {
+					throw new Exception('Env-specific composer.lock file is missing -> cannot update composer-managed files');
+				}
+				if (!file_exists($composerLockPath)) {
+					throw new Exception('`composer.lock` file is missing -> cannot update composer-managed files');
+				}
+
+				// load versioned composer.lock
+				$command = "git show $revision:$composerLockFileName";
 				$output = [];
-				exec('git status --porcelain', $output);
-				if (!empty($output)) {
-					$this->output('First-time deployment requires clean working directory! Clean it please and retry!');
+				exec($command, $output);
+				$localComposerLockJson = json_decode(join('', $output));
+
+				$workingLocalComposerLockJson = json_decode(file_get_contents($composerLockPath));
+				if ($workingLocalComposerLockJson->{'content-hash'} !== $localComposerLockJson->{'content-hash'}) {
+					$this->output('There are uncommitted changes in `composer.lock` file so it is not safe to deploy now (we could upload packages with other versions than those in composer.lock'
+						. "\nPlease commit it and try again.");
 					exit;
 				}
-			}
 
-			if ($revert) {
-				if (!isset($previousRevision)) {
-					throw new Exception("Could not find previous revision in {$server['host']}, which means that reverting is not possible.");
-				}
+				$deployedComposerLockJson = json_decode(file_get_contents($envComposerLockPath));
+				$localPackages = $localComposerLockJson->packages;
+				$deployedPackages = $deployedComposerLockJson->packages;
+				if ($localComposerLockJson->{'content-hash'} !== $deployedComposerLockJson->{'content-hash'}) {
 
-				$this->output("WARNING: Composer-managed libraries will NOT be reverted!");
-
-				# Set revision to PREVIOUS_REVISION, for reverting.
-				$revision = $previousRevision;
-				if ($remoteRevision != $revision) {
-					$this->output("Reverting from " . substr($remoteRevision, 0, 6) . " to " . substr($revision, 0, 6) . ".");
-					$this->output("----------------------------");
-				}
-			} else {
-				if ($remoteRevision && $remoteRevision != $revision) {
-					$this->output("Deploying update from " . substr($remoteRevision, 0, 6) . " to " . substr($revision, 0, 6) . ".");
-					$this->output("----------------------------");
-				}
-			}
-
-			$files = $this->getFilesToUpload($remoteRevision, $revision, $server);
-			$filesToUpload = $files['upload'];
-			$filesToDelete = $files['delete'];
-			unset($files);
-
-			$composerLockPath = __DIR__ . '/composer.lock';
-			$envComposerLockPath = GIT_DEPLOY_DIR . '/' . $server['env'] . '.composer.lock';
-
-			if ($isFirstTimeDeploy) {
-
-				// paths are relative to root
-				$firstTimeDeployFiles = [
-					'app/config/user_pass.neon' => 'app/config/user_pass.neon',
-				];
-
-				if ($server['uploadComposerLibs']) {
-					// upload composer-managed packages
-					$dirs = ['vendor/'];
-					foreach ($dirs as $relPath) {
-						$absPath = __DIR__ . '/' . $relPath;
-						if (is_dir($absPath)) {
-							foreach (get_recursive_file_list($absPath, $relPath) as $f) {
-								// skip git-tracked vendor/others directory
-								if (strpos($f, 'vendor/others/') !== 0) {
-									$firstTimeDeployFiles[$f] = $f;
-								}
-							}
-						}
-					}
-				}
-
-				$filesToUpload = array_merge($filesToUpload, $firstTimeDeployFiles);
-			} else {
-				// check if composer-managed libs have changed
-				// we handle only new/updated libraries (to upload), not removed ones (to remove)
-				$composerChangedFiles = [];
-				$composerLockFileName = $server['gitDeployDirectory'] . 'composer.lock';
-				if (isset($filesToUpload[$composerLockFileName])) {
-					if (!file_exists($envComposerLockPath)) {
-						throw new Exception('Env-specific composer.lock file is missing -> cannot update composer-managed files');
-					}
-					if (!file_exists($composerLockPath)) {
-						throw new Exception('`composer.lock` file is missing -> cannot update composer-managed files');
-					}
-
-					// load versioned composer.lock
-					$command = "git show $revision:$composerLockFileName";
-					$output = [];
-					exec($command, $output);
-					$localComposerLockJson = json_decode(join('', $output));
-					// var_dump($localComposerLockJson);die;
-
-					$workingLocalComposerLockJson = json_decode(file_get_contents($composerLockPath));
-					if ($workingLocalComposerLockJson->{'content-hash'} !== $localComposerLockJson->{'content-hash'}) {
-						$this->output('There are uncommitted changes in `composer.lock` file so it is not safe to deploy now (we could upload packages with other versions than those in composer.lock'
-							. "\nPlease commit it and try again.");
-						exit;
-					}
-
-					$deployedComposerLockJson = json_decode(file_get_contents($envComposerLockPath));
-					$localPackages = $localComposerLockJson->packages;
-					$deployedPackages = $deployedComposerLockJson->packages;
-					if ($localComposerLockJson->{'content-hash'} !== $deployedComposerLockJson->{'content-hash'}) {
-
-						if (!$server['uploadComposerLibs']) {
-							$this->output('A change in composer managed libraries detected..Please run `composer install` on server.');
+					if (!$server['uploadComposerLibs']) {
+						if ($server['scheme'] === 'sftp') {
+							$this->output('A change in composer managed libraries detected.. Running `composer install` on server via SSH.');
+							$command = "cd {$server['path']} && composer install -o --no-dev";
+							$sshOutput = $connection->exec($command);
+							$this->output("SSH Output:\n" . $sshOutput);
+							$this->output('`composer install` command has been executed.');
 						} else {
-							/**
-							 * Has package version changed?
-							 * @param string $name package name
-							 * @param string $version current package version
-							 * @param string $deployedVersion deployed package version to be set
-							 * @return bool
-							 */
-							$hasPackageChanged = function ($name, $version, &$deployedVersion = NULL) use ($deployedPackages) {
-								foreach ($deployedPackages as $p) {
-									if ($p->name === $name) {
-										$deployedVersion = $p->version;
-										if ($p->version === $version) {
-											return false;
-										}
-									}
-								}
-								return true;
-							};
-
-							$composerLibChanged = false;
-							foreach ($localComposerLockJson->packages as $p) {
-								$deployedVersion = NULL;
-								if ($hasPackageChanged($p->name, $p->version, $deployedVersion)) {
-									$composerLibChanged = true;
-									addFilesFromDirectory('vendor/' . $p->name . '/', $composerChangedFiles);
-
-									$this->output("Composer: <$p->name> changed from <$deployedVersion> to <$p->version>");
-								}
-							}
-
-							// if changed, copy composer/ & autoload.php
-							if ($composerLibChanged) {
-								addFilesFromDirectory('vendor/composer/', $composerChangedFiles);
-								$composerChangedFiles['vendor/autoload.php'] = 'vendor/autoload.php';
-							}
-
-							$filesToUpload = array_merge($filesToUpload, $composerChangedFiles);
+							$this->output('A change in composer managed libraries detected..Please run `composer install` on server.');
 						}
 					} else {
-						$this->output('No change in composer managed libraries detected..');
+						/**
+						 * Has package version changed?
+						 * @param string $name package name
+						 * @param string $version current package version
+						 * @param string $deployedVersion deployed package version to be set
+						 * @return bool
+						 */
+						$hasPackageChanged = function ($name, $version, &$deployedVersion = NULL) use ($deployedPackages) {
+							foreach ($deployedPackages as $p) {
+								if ($p->name === $name) {
+									$deployedVersion = (string)$p->version;
+									if ($p->version === $version) {
+										return false;
+									}
+								}
+							}
+							return true;
+						};
+
+						$composerLibChanged = false;
+						foreach ($localComposerLockJson->packages as $p) {
+							$deployedVersion = NULL;
+							if ($hasPackageChanged($p->name, $p->version, $deployedVersion)) {
+								$composerLibChanged = true;
+								addFilesFromDirectory('vendor/' . $p->name . '/', $composerChangedFiles);
+
+								$this->output("Composer: <$p->name> changed from <$deployedVersion> to <$p->version>");
+							}
+						}
+
+						// if changed, copy composer/ & autoload.php
+						if ($composerLibChanged) {
+							addFilesFromDirectory('vendor/composer/', $composerChangedFiles);
+							$composerChangedFiles['vendor/autoload.php'] = 'vendor/autoload.php';
+						}
+
+						$filesToUpload = array_merge($filesToUpload, $composerChangedFiles);
 					}
+				} else {
+					$this->output('No change in composer managed libraries detected..');
 				}
 			}
+		}
 
-			$maintenanceModeTurnedOn = false;
-			// turn on "Maintenance mode" before uploading
-			if (
-				$server['maintenanceMode'] && !$isFirstTimeDeploy && (count($filesToUpload) > 0 or count($filesToDelete) > 0)
-			) {
-				$indexPath = $server['indexPath'];
-				$maintenancePath = $server['maintenancePath'];
-				$tmpIndexPath = $indexPath . '.tmp';
-				// alternatively we could just ftp_put index.php to index.php.tmp to avoid possible error of missing index.php file
-				// after indexPath renamed to tmpIndexPath but maintenancePath not yet renamed to indexPath
+		$maintenanceModeTurnedOn = false;
+		// turn on "Maintenance mode" before uploading
+		if (
+			$server['maintenanceMode'] && !$isFirstTimeDeploy && (count($filesToUpload) > 0 or count($filesToDelete) > 0)
+		) {
+			$indexPath = $server['indexPath'];
+			$maintenancePath = $server['maintenancePath'];
+			$tmpIndexPath = $indexPath . '.tmp';
+			if ($server['scheme'] === 'sftp') {
+				$connection->rename($indexPath, $tmpIndexPath);
+				$connection->rename($maintenancePath, $indexPath);
+			} else {
 				ftp_rename($connection, $indexPath, $tmpIndexPath);
 				ftp_rename($connection, $maintenancePath, $indexPath);
-				$this->output('Maintenance mode turned ON');
-				$maintenanceModeTurnedOn = true;
+			}
+			$this->output('Maintenance mode turned ON');
+			$maintenanceModeTurnedOn = true;
+		}
+
+		// most of the time $localFile === $remoteFile - $remoteFile just defines path where $localFile gets uploaded
+		foreach ($filesToUpload as $localFile => $remoteFile) {
+			# Make sure the folder exists in the server.
+			$ret = $this->mkdir($connection, $remoteFile, $server['scheme']);
+			if ($ret === false) {
+				$this->output("A problem occurred while attempting to create a folder. Upload to this server cannot continue.");
+				return;
 			}
 
-			// most of the time $localFile === $remoteFile - $remoteFile just defines path where $localFile gets uploaded
-			foreach ($filesToUpload as $localFile => $remoteFile) {
-				# Make sure the folder exists in the FTP server.
-				$ret = $this->ftp_mkdir($connection, $remoteFile);
-				if ($ret === false) {
-					$this->output("A problem occurred while attempting to create a folder. Upload to this server cannot continue.");
-					return;
+			// first time we upload files as they are (working directory is clean)
+			// same for composerChangedFiles as they are not tracked with git
+			if ($isFirstTimeDeploy || isset($composerChangedFiles[$localFile])) {
+				$unlinkTmpFile = FALSE;
+				$tmpFileToUpload = $localFile;
+				// other times we upload tmp file with content of $revision
+			} else {
+				$unlinkTmpFile = TRUE;
+				$tmpFileToUpload = GIT_DEPLOY_DIR . '/tmpFileToUpload';
+				$command = "git show $revision:$localFile > $tmpFileToUpload";
+				$output = [];
+				exec($command, $output);
+			}
+
+			$uploaded = false;
+			$attempts = 1;
+			while (!$uploaded) {
+
+				if ($attempts == 10) {
+					$this->output("Tried to upload $localFile 10 times, and failed 10 times. Something is wrong, so I'm going to stop executing now.");
+					exit;
 				}
 
-				// first time we upload files as they are (working directory is clean)
-				// same for composerChangedFiles as they are not tracked with git
-				if ($isFirstTimeDeploy || isset($composerChangedFiles[$localFile])) {
-					$unlinkTmpFile = FALSE;
-					$tmpFileToUpload = $localFile;
-					// other times we upload tmp file with content of $revision
+				# This makes sure to repeat the upload until it finally succeeds.
+				if ($server['scheme'] === 'sftp') {
+					$uploaded = $connection->put($remoteFile, $tmpFileToUpload, SFTP::SOURCE_LOCAL_FILE);
 				} else {
-					$unlinkTmpFile = TRUE;
-					$tmpFileToUpload = GIT_DEPLOY_DIR . '/tmpFileToUpload';
-					$command = "git show $revision:$localFile > $tmpFileToUpload";
-					$output = [];
-					exec($command, $output);
-				}
-
-				$uploaded = false;
-				$attempts = 1;
-				while (!$uploaded) {
-
-					if ($attempts == 10) {
-						$this->output("Tried to upload $localFile 10 times, and failed 10 times. Something is wrong, so I'm going to stop executing now.");
-						exit;
-					}
-
-					# This makes sure to repeat the upload until it finally succeeds.
-					# Hopefully helps fix a problem where some files aren't transferred.
-					# Transfer js [& css] files using ASCII mode for proper end lines for Packer to work properly until the Packer fix https://github.com/tholu/php-packer/issues/15
 					$ext = strtolower(pathinfo($remoteFile, PATHINFO_EXTENSION));
-					$ftpMode = in_array($ext, ['js', /*'css', 'html', 'latte', 'php'*/]) ? FTP_ASCII : FTP_BINARY;
+					$ftpMode = in_array($ext, ['js', 'css', 'html', 'latte', 'php']) ? FTP_ASCII : FTP_BINARY;
 					$uploaded = @ftp_put($connection, $remoteFile, $tmpFileToUpload, $ftpMode);
-
-					if (!$uploaded) {
-						$attempts = $attempts + 1;
-						$this->output("Failed to upload {$localFile}. Retrying (attempt $attempts/10)... ");
-					}
 				}
-				$this->output("Uploaded {$localFile}");
-				if ($unlinkTmpFile) {
-					unlink($tmpFileToUpload);
+
+				if (!$uploaded) {
+					$attempts = $attempts + 1;
+					$this->output("Failed to upload {$localFile}. Retrying (attempt $attempts/10)... ");
+					// Small delay before retry
+					usleep(500000);
 				}
 			}
+			$this->output("Uploaded {$localFile}");
+			if ($unlinkTmpFile) {
+				unlink($tmpFileToUpload);
+			}
+		}
 
-			foreach ($filesToDelete as $file) {
+		foreach ($filesToDelete as $file) {
+			if ($server['scheme'] === 'sftp') {
+				$connection->delete($file);
+			} else {
 				@ftp_delete($connection, $file);
-				$this->output("Deleted {$file}");
 			}
+			$this->output("Deleted {$file}");
+		}
 
-			if (!empty($server['clean_directories'])) {
-				foreach ($server['clean_directories'] as $dir) {
-					$this->ftp_rmdirr($connection, $dir);
-					$this->output("Emptied {$dir}");
-				}
+		if (!empty($server['clean_directories'])) {
+			foreach ($server['clean_directories'] as $dir) {
+				$this->rmdirr($connection, $dir, $server['scheme']);
+				$this->output("Emptied {$dir}");
+			}
+		} else {
+			$this->output("\r\n*** Don't forget to empty cache if needed! ***\r\n");
+		}
+
+		if (count($filesToUpload) > 0 or count($filesToDelete) > 0) {
+			$this->output("----------------------------");
+			$temp = tempnam(sys_get_temp_dir(), 'gitRevision');
+			file_put_contents($temp, $revision);
+			if ($server['scheme'] === 'sftp') {
+				$connection->put('REVISION', $temp, SFTP::SOURCE_LOCAL_FILE);
 			} else {
-				$this->output("\r\n*** Don't forget to empty cache if needed! ***\r\n");
-			}
-
-			if (count($filesToUpload) > 0 or count($filesToDelete) > 0) {
-				$this->output("----------------------------");
-				$temp = tempnam(sys_get_temp_dir(), 'gitRevision');
-				file_put_contents($temp, $revision);
 				ftp_put($connection, 'REVISION', $temp, FTP_ASCII);
-				unlink($temp);
-				$this->output("Uploaded REVISION file.");
+			}
+			unlink($temp);
+			$this->output("Uploaded REVISION file.");
 
-				file_put_contents(getRemoteRevisionLocalFilepath(), $revision);
-				$this->output("Stored local REMOTE_REVISION file.");
+			file_put_contents(getRemoteRevisionLocalFilepath(), $revision);
+			$this->output("Stored local REMOTE_REVISION file.");
 
-				# Upload file containing the current revision, for reverting when necessary.
-				# But, only if the revision we're deploying is different from the one currently deployed.
-				if ($remoteRevision != $revision) {
-					$temp = tempnam(sys_get_temp_dir(), 'gitRevision');
-					file_put_contents($temp, $remoteRevision);
+			# Upload file containing the current revision, for reverting when necessary.
+			# But, only if the revision we're deploying is different from the one currently deployed.
+			if ($remoteRevision != $revision) {
+				$temp = tempnam(sys_get_temp_dir(), 'gitRevision');
+				file_put_contents($temp, $remoteRevision);
+				if ($server['scheme'] === 'sftp') {
+					$connection->put('PREVIOUS_REVISION', $temp, SFTP::SOURCE_LOCAL_FILE);
+				} else {
 					ftp_put($connection, 'PREVIOUS_REVISION', $temp, FTP_ASCII);
-					unlink($temp);
-					$this->output("Uploaded PREVIOUS_REVISION file.");
 				}
-
-				// update env-specific composer.lock file
-				if (file_exists($composerLockPath)) {
-					copy($composerLockPath, $envComposerLockPath);
-				}
-			} else {
-				$this->output("No files to upload.");
+				unlink($temp);
+				$this->output("Uploaded PREVIOUS_REVISION file.");
 			}
 
-			# when uploading done turn off "Maintenance mode"
-			if ($maintenanceModeTurnedOn) {
+			// update env-specific composer.lock file
+			if (file_exists($composerLockPath)) {
+				copy($composerLockPath, $envComposerLockPath);
+			}
+		} else {
+			$this->output("No files to upload.");
+		}
+
+		# when uploading done turn off "Maintenance mode"
+		if ($maintenanceModeTurnedOn) {
+			if ($server['scheme'] === 'sftp') {
+				$connection->rename($indexPath, $maintenancePath);
+				$connection->rename($tmpIndexPath, $indexPath);
+			} else {
 				ftp_rename($connection, $indexPath, $maintenancePath);
 				ftp_rename($connection, $tmpIndexPath, $indexPath);
-				$this->output("Maintenance mode turned OFF");
 			}
+			$this->output("Maintenance mode turned OFF");
+		}
 
-			if (!empty($server['file_permissions'])) {
-				$this->setFilePermissions($connection, $server['file_permissions']);
+		if (!empty($server['file_permissions'])) {
+			$this->setFilePermissions($connection, $server['file_permissions'], $server['scheme']);
+		}
+
+		if (!empty($server['after'])) {
+			foreach ($server['after'] as $url) {
+				@fopen($url, 'r');
+				$this->output("$url called");
 			}
+		}
 
-			if (!empty($server['after'])) {
-				foreach ($server['after'] as $url) {
-					fopen($url, 'r');
-					$this->output("$url called");
-				}
-			}
+		$this->output("----------------------------");
+		$this->output("Finished working on {$server['host']}{$server['path']}");
+		$this->output("----------------------------");
 
-			$this->output("----------------------------");
-
-			$this->output("Finished working on {$server['host']}{$server['path']}");
-
-			$this->output("----------------------------");
-
-			ftp_close($connection);
+		if ($server['scheme'] === 'sftp') {
+			$connection->disconnect();
+		} else {
+			@ftp_close($connection);
 		}
 	}
 
 
 	/**
 	 * Clean (and optionally remove) whole directory recursively
-	 * @link http://www.php.net/manual/en/function.ftp-nlist.php#62306
 	 */
-	function ftp_rmdirr($handle, string $path, bool $rmDir = false, int $level = 1): bool
+	function rmdirr($handle, string $path, string $scheme, bool $rmDir = false, int $level = 1): bool
 	{
-		if (!@ftp_delete($handle, $path)) {
-			$this->output("Cleaning: $path");
-			$list = @ftp_nlist($handle, $path);
-			if (!empty($list)) {
+		if ($scheme === 'sftp') {
+			$list = $handle->nlist($path);
+			if ($list !== false) {
 				foreach ($list as $value) {
-					if (in_array(basename($value), ['.', '..'])) {
-						continue;
+					$baseName = basename($value);
+					if ($baseName === '.' || $baseName === '..') continue;
+					$fullPath = $path . '/' . $baseName;
+					if ($handle->is_dir($fullPath)) {
+						$this->rmdirr($handle, $fullPath, $scheme, true, $level + 1);
+					} else {
+						$handle->delete($fullPath);
 					}
-					// $this->ftp_rmdirr($handle, $value, true, $level + 1);
-					$this->ftp_rmdirr($handle, $path . '/' . basename($value), true, $level + 1);
 				}
 			}
-		}
-
-		if ($rmDir && $level > 1) {
-			if (@ftp_rmdir($handle, $path))
-				return true;
-			else
-				return false;
+			if ($rmDir && $level > 1) {
+				return $handle->rmdir($path);
+			}
+		} else {
+			if (!@ftp_delete($handle, $path)) {
+				$this->output("Cleaning: $path");
+				$list = @ftp_nlist($handle, $path);
+				if (!empty($list)) {
+					foreach ($list as $value) {
+						if (in_array(basename($value), ['.', '..'])) continue;
+						$this->rmdirr($handle, $path . '/' . basename($value), $scheme, true, $level + 1);
+					}
+				}
+			}
+			if ($rmDir && $level > 1) {
+				return @ftp_rmdir($handle, $path);
+			}
 		}
 
 		return true;
@@ -718,16 +793,21 @@ class Terra_Git
 
 	/**
 	 * Set 0777 file permissions for $items (create them if not present)
-	 * @param ftp_handle
-	 * @param array of files/directories to chmod
 	 */
-	function setFilePermissions($connection, array $items = []): void
+	function setFilePermissions($connection, array $items = [], string $scheme = 'ftp'): void
 	{
 		$mode = 0777;
 		foreach ($items as $path) {
-			if (!@ftp_chmod($connection, $mode, $path)) {
-				ftp_mkdir($connection, $path);
-				ftp_chmod($connection, $mode, $path);
+			if ($scheme === 'sftp') {
+				if (!$connection->chmod($mode, $path)) {
+					$connection->mkdir($path);
+					$connection->chmod($mode, $path);
+				}
+			} else {
+				if (!@ftp_chmod($connection, $mode, $path)) {
+					ftp_mkdir($connection, $path);
+					ftp_chmod($connection, $mode, $path);
+				}
 			}
 		}
 		$this->output('Permissions set.');
@@ -736,23 +816,21 @@ class Terra_Git
 
 	/**
 	 * Get content of remote revision file.
-	 * @param ftp_handle
-	 * @param string $filename
-	 * @return ?string
 	 */
-	function getRemoteRevisionContent($connection, string $filename = 'REVISION'): ?string
+	function getRemoteRevisionContent($connection, string $filename = 'REVISION', string $scheme = 'ftp'): ?string
 	{
-		$tmpFile = tmpfile();
-		$ret = NULL;
-
-		if (@ftp_fget($connection, $tmpFile, $filename, FTP_ASCII)) {
-			fseek($tmpFile, 0);
-			$ret = trim(fread($tmpFile, 1024));
-			fclose($tmpFile);
+		if ($scheme === 'sftp') {
+			$content = $connection->get($filename);
+			return $content !== false ? trim($content) : null;
 		} else {
-			# Couldn't get the file. I assume it's because the file didn't exist.
+			$tmpFile = tmpfile();
+			$ret = NULL;
+			if (@ftp_fget($connection, $tmpFile, $filename, FTP_ASCII)) {
+				fseek($tmpFile, 0);
+				$ret = trim(fread($tmpFile, 1024));
+				fclose($tmpFile);
+			}
+			return $ret;
 		}
-
-		return $ret;
 	}
 }
