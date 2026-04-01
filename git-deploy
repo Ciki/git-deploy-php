@@ -623,7 +623,7 @@ class Terra_Git
 			} else {
 				$unlinkTmpFile = TRUE;
 				$tmpFileToUpload = GIT_DEPLOY_DIR . '/tmpFileToUpload';
-				$command = "git show $revision:$localFile > $tmpFileToUpload";
+				$command = "git show \"$revision:$localFile\" > \"$tmpFileToUpload\"";
 				$output = [];
 				exec($command, $output);
 			}
