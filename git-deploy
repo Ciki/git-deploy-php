@@ -641,9 +641,8 @@ class Terra_Git
 				if ($server['scheme'] === 'sftp') {
 					$uploaded = $connection->put($remoteFile, $tmpFileToUpload, SFTP::SOURCE_LOCAL_FILE);
 				} else {
-					$ext = strtolower(pathinfo($remoteFile, PATHINFO_EXTENSION));
-					$ftpMode = in_array($ext, ['js', 'css', 'html', 'latte', 'php']) ? FTP_ASCII : FTP_BINARY;
-					$uploaded = @ftp_put($connection, $remoteFile, $tmpFileToUpload, $ftpMode);
+					// Always use BINARY mode — ASCII mode corrupts large minified files (e.g. xlsx.full.min.js)
+					$uploaded = @ftp_put($connection, $remoteFile, $tmpFileToUpload, FTP_BINARY);
 				}
 
 				if (!$uploaded) {
