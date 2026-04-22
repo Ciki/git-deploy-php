@@ -529,7 +529,36 @@ class Terra_Git
 				$deployedComposerLockJson = json_decode(file_get_contents($envComposerLockPath));
 				$localPackages = $localComposerLockJson->packages;
 				$deployedPackages = $deployedComposerLockJson->packages;
-				if ($localComposerLockJson->{'content-hash'} !== $deployedComposerLockJson->{'content-hash'}) {
+
+				// content-hash is derived from composer.json requirements only, so a
+				// `composer update <package>` that bumps a git reference within the
+				// allowed version range leaves content-hash intact while the resolved
+				// package actually changed. Detect changes by comparing version AND
+				// source.reference for every package.
+				$deployedByName = [];
+				foreach ($deployedPackages as $p) {
+					$deployedByName[$p->name] = $p;
+				}
+				$packageRef = static function ($p): ?string {
+					return $p->source->reference ?? $p->dist->reference ?? null;
+				};
+				$packagesChanged = false;
+				foreach ($localPackages as $p) {
+					$deployed = $deployedByName[$p->name] ?? null;
+					if (
+						$deployed === null
+						|| $deployed->version !== $p->version
+						|| $packageRef($deployed) !== $packageRef($p)
+					) {
+						$packagesChanged = true;
+						break;
+					}
+				}
+				if (!$packagesChanged && count((array)$deployedPackages) !== count((array)$localPackages)) {
+					$packagesChanged = true;
+				}
+
+				if ($packagesChanged) {
 
 					if (!$server['uploadComposerLibs']) {
 						if ($server['scheme'] === 'sftp') {
@@ -543,28 +572,27 @@ class Terra_Git
 						}
 					} else {
 						/**
-						 * Has package version changed?
+						 * Has package version or source reference changed?
 						 * @param string $name package name
 						 * @param string $version current package version
+						 * @param string|null $reference current package source/dist reference
 						 * @param string $deployedVersion deployed package version to be set
 						 * @return bool
 						 */
-						$hasPackageChanged = function ($name, $version, &$deployedVersion = NULL) use ($deployedPackages) {
-							foreach ($deployedPackages as $p) {
-								if ($p->name === $name) {
-									$deployedVersion = (string)$p->version;
-									if ($p->version === $version) {
-										return false;
-									}
-								}
+						$hasPackageChanged = function ($name, $version, $reference, &$deployedVersion = NULL) use ($deployedByName, $packageRef) {
+							$deployed = $deployedByName[$name] ?? null;
+							if ($deployed === null) {
+								return true;
 							}
-							return true;
+							$deployedVersion = (string)$deployed->version;
+							return $deployed->version !== $version
+								|| $packageRef($deployed) !== $reference;
 						};
 
 						$composerLibChanged = false;
 						foreach ($localComposerLockJson->packages as $p) {
 							$deployedVersion = NULL;
-							if ($hasPackageChanged($p->name, $p->version, $deployedVersion)) {
+							if ($hasPackageChanged($p->name, $p->version, $packageRef($p), $deployedVersion)) {
 								$composerLibChanged = true;
 								addFilesFromDirectory('vendor/' . $p->name . '/', $composerChangedFiles);
 
