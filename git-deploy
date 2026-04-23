@@ -762,38 +762,42 @@ class Terra_Git
 				$this->output("$url called, streaming response:");
 				// Stream the response line by line so long-running deploy hooks (e.g. DB
 				// migrations with heavy ALTERs) can finish before we exit and operators
-				// see progress / errors immediately. SSL peer verification is disabled --
-				// the URL + token come from deploy.ini which we trust, and the connection
-				// targets our own server.
-				$ctx = stream_context_create([
-					'http' => [
-						'timeout' => 2000, // ~33 min max idle (PHP 8.5 caps HTTP wrapper timeout at ~2147 s)
-						'ignore_errors' => true, // keep reading body on HTTP 4xx/5xx
-					],
-					'ssl' => [
-						'verify_peer' => false,
-						'verify_peer_name' => false,
-					],
-				]);
-				$stream = fopen($url, 'r', false, $ctx);
-				if ($stream === false) {
-					$err = error_get_last();
-					$this->output("  FAILED to open $url: " . ($err['message'] ?? 'unknown error'));
-					continue;
-				}
-				stream_set_timeout($stream, 2000);
-				while (!feof($stream)) {
-					$line = fgets($stream);
-					if ($line === false) {
-						$info = stream_get_meta_data($stream);
-						if (!empty($info['timed_out'])) {
-							$this->output("  stream timed out after 33 min of silence");
-						}
-						break;
+				// see progress / errors immediately. We use cURL with a write callback
+				// because PHP's built-in http:// stream wrapper buffers the entire
+				// response body in userspace before fgets() sees anything -- not
+				// suitable for streamed endpoints.
+				// SSL peer verification is disabled -- the URL + token come from
+				// deploy.ini which we trust, and the connection targets our own server.
+				$lineBuffer = '';
+				$self = $this;
+				$writeCb = static function ($ch, string $chunk) use (&$lineBuffer, $self): int {
+					$lineBuffer .= $chunk;
+					while (($nl = strpos($lineBuffer, "\n")) !== false) {
+						$line = substr($lineBuffer, 0, $nl);
+						$lineBuffer = substr($lineBuffer, $nl + 1);
+						$self->output('  ' . rtrim($line, "\r"));
 					}
-					$this->output('  ' . rtrim($line, "\r\n"));
+					return strlen($chunk);
+				};
+				$ch = curl_init($url);
+				curl_setopt_array($ch, [
+					CURLOPT_WRITEFUNCTION => $writeCb,
+					CURLOPT_TIMEOUT => 0, // unlimited total time; long migrations may run for ages
+					CURLOPT_CONNECTTIMEOUT => 30,
+					CURLOPT_LOW_SPEED_LIMIT => 1, // abort if throughput drops below 1 B/s
+					CURLOPT_LOW_SPEED_TIME => 2000, // ...for 33 min (effective idle timeout)
+					CURLOPT_SSL_VERIFYPEER => false,
+					CURLOPT_SSL_VERIFYHOST => 0,
+					CURLOPT_FAILONERROR => false, // keep streaming body on 4xx/5xx
+					CURLOPT_BUFFERSIZE => 128, // tiny receive buffer -> write callback fires often
+				]);
+				$ok = curl_exec($ch);
+				if ($ok === false) {
+					$this->output('  curl error: ' . curl_error($ch));
 				}
-				fclose($stream);
+				if ($lineBuffer !== '') {
+					$this->output('  ' . rtrim($lineBuffer, "\r\n"));
+				}
 				$this->output("$url finished");
 			}
 		}
