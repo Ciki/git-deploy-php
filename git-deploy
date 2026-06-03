@@ -768,14 +768,21 @@ class Terra_Git
 				// suitable for streamed endpoints.
 				// SSL peer verification is disabled -- the URL + token come from
 				// deploy.ini which we trust, and the connection targets our own server.
+				// Parse stream body for `DEPLOY FAILED` sentinel - streamed HTTP status
+				// is locked at 200 once first flush commits headers, so the body marker
+				// is the only reliable failure signal from after.php.
 				$lineBuffer = '';
+				$deployFailed = false;
 				$self = $this;
-				$writeCb = static function ($ch, string $chunk) use (&$lineBuffer, $self): int {
+				$writeCb = static function ($ch, string $chunk) use (&$lineBuffer, &$deployFailed, $self): int {
 					$lineBuffer .= $chunk;
 					while (($nl = strpos($lineBuffer, "\n")) !== false) {
 						$line = substr($lineBuffer, 0, $nl);
 						$lineBuffer = substr($lineBuffer, $nl + 1);
 						$self->output('  ' . rtrim($line, "\r"));
+						if (str_contains($line, 'DEPLOY FAILED')) {
+							$deployFailed = true;
+						}
 					}
 					return strlen($chunk);
 				};
@@ -797,8 +804,15 @@ class Terra_Git
 				}
 				if ($lineBuffer !== '') {
 					$this->output('  ' . rtrim($lineBuffer, "\r\n"));
+					if (str_contains($lineBuffer, 'DEPLOY FAILED')) {
+						$deployFailed = true;
+					}
 				}
 				$this->output("$url finished");
+				if ($deployFailed) {
+					$this->output('After-hook reported `DEPLOY FAILED` in stream body - aborting.');
+					exit(1);
+				}
 			}
 		}
 
