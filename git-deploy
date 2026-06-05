@@ -6,6 +6,7 @@ ini_set('max_execution_time', 0);
 
 require_once VENDOR_DIR . '/autoload.php';
 
+use phpseclib3\Crypt\PublicKeyLoader;
 use phpseclib3\Net\SFTP;
 
 $opts = getopt("lr:", ["revert", 'env:']);
@@ -207,6 +208,15 @@ class Terra_Git
 				'substitutions' => [],
 				'env' => $env,
 				'uploadComposerLibs' => false,
+				// SFTP key-based auth: path to a private key file. When set, `pass` is
+				// treated as the key passphrase (empty = unencrypted key).
+				'privateKeyPath' => '',
+				// Working directory for server-side SSH commands (composer install).
+				// FTP `path` may be chroot-relative; this is the absolute filesystem path.
+				// Falls back to `path` when empty.
+				'sshPath' => '',
+				// Server-side composer command. Falls back to a sane default when empty.
+				'composerCommand' => '',
 			], $options);
 
 			if ($options['scheme'] === 'sftp' && $options['port'] == 21) {
@@ -397,7 +407,19 @@ class Terra_Git
 
 		if ($server['scheme'] === 'sftp') {
 			$connection = new SFTP($server['host'], $server['port']);
-			if (!$connection->login($server['user'], $server['pass'])) {
+			if ($server['privateKeyPath'] !== '') {
+				if (!@file_exists($server['privateKeyPath'])) {
+					throw new Exception("Private key '{$server['privateKeyPath']}' does not exist.");
+				}
+				// `pass` doubles as the key passphrase; empty string = unencrypted key.
+				$credential = PublicKeyLoader::load(
+					file_get_contents($server['privateKeyPath']),
+					$server['pass'] !== '' ? $server['pass'] : false,
+				);
+			} else {
+				$credential = $server['pass'];
+			}
+			if (!$connection->login($server['user'], $credential)) {
 				throw new Exception("Could not login to {$server['host']} via SFTP (Tried to login as {$server['user']}).");
 			}
 			if (!$connection->chdir($server['path'])) {
@@ -472,6 +494,11 @@ class Terra_Git
 		$filesToUpload = $files['upload'];
 		$filesToDelete = $files['delete'];
 		unset($files);
+
+		// Set true when an SFTP deploy detects changed composer packages. The actual
+		// server-side `composer install` runs after the upload loop (see below) so it sees
+		// the freshly-uploaded composer.lock instead of the stale one on the server.
+		$runComposerInstallOnServer = false;
 
 		$composerLockPath = __DIR__ . '/composer.lock';
 		$envComposerLockPath = GIT_DEPLOY_DIR . '/' . $server['env'] . '.composer.lock';
@@ -562,11 +589,10 @@ class Terra_Git
 
 					if (!$server['uploadComposerLibs']) {
 						if ($server['scheme'] === 'sftp') {
-							$this->output('A change in composer managed libraries detected.. Running `composer install` on server via SSH.');
-							$command = "cd {$server['path']} && composer install -o --no-dev";
-							$sshOutput = $connection->exec($command);
-							$this->output("SSH Output:\n" . $sshOutput);
-							$this->output('`composer install` command has been executed.');
+							// Defer the actual `composer install` until after the upload loop;
+							// running it here would execute against the OLD composer.lock still on
+							// the server (the new lock is uploaded later in this function).
+							$runComposerInstallOnServer = true;
 						} else {
 							$this->output('A change in composer managed libraries detected..Please run `composer install` on server.');
 						}
@@ -693,6 +719,26 @@ class Terra_Git
 				@ftp_delete($connection, $file);
 			}
 			$this->output("Deleted {$file}");
+		}
+
+		// Now that composer.json + composer.lock are uploaded, run the deferred server-side
+		// `composer install`. Done before REVISION is written (a failed install aborts without
+		// marking the deploy successful) and before the `after` hook (after.php loads the app
+		// + vendor, so it must see the new packages).
+		if ($runComposerInstallOnServer) {
+			$this->output('A change in composer managed libraries detected.. Running `composer install` on server via SSH.');
+			$sshCwd = $server['sshPath'] !== '' ? $server['sshPath'] : $server['path'];
+			$composerCmd = $server['composerCommand'] !== '' ? $server['composerCommand'] : 'composer install -o --no-dev';
+			$command = 'cd ' . escapeshellarg($sshCwd) . ' && ' . $composerCmd . ' 2>&1';
+			$sshOutput = $connection->exec($command);
+			$this->output("SSH Output:\n" . $sshOutput);
+			// `DEPLOY FAILED` marker aborts the run; the streamed deploy client also greps for
+			// it. exec() exit status is the authoritative signal.
+			if ($connection->getExitStatus() !== 0) {
+				$this->output('DEPLOY FAILED: `composer install` exited with a non-zero status.');
+				exit(1);
+			}
+			$this->output('`composer install` command has been executed.');
 		}
 
 		if (!empty($server['clean_directories'])) {
