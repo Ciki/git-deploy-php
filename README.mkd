@@ -47,6 +47,26 @@ To get the hash of the current revision, you can use:
 
     git rev-parse HEAD
 
+### SFTP & automatic Composer install
+
+Besides FTP, deployment over **SFTP** is supported - set `scheme = sftp` (the port then defaults to 22). SFTP can authenticate with a private key instead of a password:
+
+    [example]
+    scheme = sftp
+    host = example.com
+    user = deploy
+    path = /var/www/app/
+    ; private-key auth - `pass` is used as the key passphrase (leave empty for an unencrypted key)
+    privateKeyPath = /home/me/.ssh/deploy_key
+    pass =
+
+When the deployed `composer.lock` changes its resolved packages, git-deploy can run `composer install` on the server over the same SSH connection (SFTP only). It runs **after** the changed files are uploaded - so it sees the new `composer.lock` - and aborts the deployment if Composer exits with a non-zero status:
+
+    ; absolute working directory for the SSH command (defaults to `path`)
+    sshPath = /var/www/app/
+    ; the command to run (defaults to `composer install -o --no-dev`)
+    composerCommand = "sudo -u www-data composer install -o --no-dev"
+
 Advanced Usage
 --------------
 
