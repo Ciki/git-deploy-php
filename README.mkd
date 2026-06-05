@@ -4,112 +4,172 @@ git-deploy-php
 Description
 -----------
 
-git-deploy-php allows quick and easy deployments of Git repositories to FTP servers.
+git-deploy-php deploys a Git repository to a remote server over **FTP, FTPS or SFTP**, uploading only the files that changed between the currently deployed revision and the one you are deploying.
 
-It was created to simplify the process of deploying projects to shared hosting environments where shell access is not available, and to save bandwidth, by only uploading the files that have changed.
+It was created to simplify deployments to shared hosting where shell access may not be available, and to save bandwidth by transferring only the diff. On top of the original FTP tool this fork adds SFTP (with private-key auth), maintenance mode, post-deploy HTTP hooks with live streaming, and Composer handling (upload changed vendor files, or run `composer install` on the server over SSH).
+
+Requirements
+------------
+
+- PHP 8.1+
+- [phpseclib/phpseclib](https://github.com/phpseclib/phpseclib) `~3.0` (only needed for SFTP). Installed automatically when you require this package via Composer.
+
+Installation
+------------
+
+Via Composer:
+
+    composer require --dev ciki/git-deploy-php
+
+or simply drop the `git-deploy` script into your project root. The script expects to live in the **project root** - it resolves `.gitdeploy/` (config) and `vendor/` (autoloader, for SFTP) relative to its own location.
 
 Usage
 -----
 
-Using git-deploy-php could not be easier.
+1. Create a `.gitdeploy/` directory in your project root.
+2. Put a `deploy.ini` (or `<env>.ini`) file in it (see below).
+3. Run `php git-deploy` (or `php git-deploy --env=<env>`).
 
-1. Drop `git-deploy` into your project.
-2. Create the `deploy.ini` file (see below).
-3. Execute `php git-deploy`.
+The first time it runs against a server, git-deploy assumes the server is empty and uploads every tracked file. On later runs it reads the `REVISION` file it stored on the server and uploads/deletes only what changed since then.
 
-And there you go. It's that simple.
+*Note:* the script ignores itself (`git-deploy`) and `.gitignore` - they are never uploaded.
 
-### deploy.ini
+### Multiple environments
 
-In the root directory of your source code, create a `deploy.ini` file.
+The `.ini` file name selects the environment. `deploy.ini` is the default; `--env=staging` uses `staging.ini`. This is the easy way to separate staging and production:
 
-*Note: `deploy.ini` is the default file's name. You can name it `staging.ini`, for example, and execute `php git-deploy staging`. That serves as an easy way to separate the deployment to staging and production servers.*
+    php git-deploy                 # uses .gitdeploy/deploy.ini
+    php git-deploy --env=staging   # uses .gitdeploy/staging.ini
 
-    ; This is a sample deploy.ini file.
-    
+Configuration
+-------------
+
+A config file is a standard `.ini` with one `[section]` per server (you can deploy to several servers from one file). All keys are optional except the connection details.
+
+### Connection
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `scheme` | `ftp` | `ftp`, `ftps` or `sftp`. |
+| `host` | | Server hostname or IP. |
+| `port` | `21` (`22` for sftp) | Server port. |
+| `user` | | Login user. |
+| `pass` | | Password. For SFTP with `privateKeyPath` set, this is used as the **key passphrase** instead (leave empty for an unencrypted key). |
+| `path` | `/` | Remote target directory. For a non-chrooted SFTP user this must be the **absolute** path. |
+| `passive` | `true` | FTP passive mode (FTP/FTPS only). |
+| `privateKeyPath` | `` | SFTP only: path to a private key file. When set, login uses the key instead of `pass`. |
+| `skip` | `false` | Skip this server entirely. |
+
+You can also express the connection inline as a URL section header:
+
+    [sftp://deploy@example.com:22/var/www/app]
+
+### What gets deployed
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `gitDeployDirectory` | `` | Deploy only files under this local subdirectory. Usually paired with a `substitutions` entry that strips the prefix. |
+| `substitutions[]` | `[]` | `preg_replace` patterns applied to map local paths to remote paths, e.g. `substitutions['#web/#'] = 'www/'`. |
+
+### Maintenance mode
+
+While uploading, git-deploy can swap your front controller for a maintenance page (it renames `indexPath` aside and moves `maintenancePath` into its place, then reverses it when done).
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `maintenanceMode` | `true` | Enable the swap during upload (skipped on first-time deploy). |
+| `indexPath` | `web/index.php` | Front controller, taken offline during deploy. |
+| `maintenancePath` | `web/.maintenance.php` | Page served while deploying. |
+
+### Cleanup & permissions
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `clean_directories[]` | `[]` | Directories emptied on every deploy (e.g. `temp/cache`). If none are set, git-deploy just prints a reminder to clear caches. |
+| `file_permissions[]` | `[]` | Paths `chmod`-ed to `0777` (created if missing) on every deploy. |
+
+### Composer handling
+
+When the deployed `composer.lock` changes its **resolved packages** (detected by comparing each package's version and `source`/`dist` reference, not just `composer.lock`'s content-hash), git-deploy reconciles the server's dependencies. There are two strategies:
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `uploadComposerLibs` | `false` | `false`: run `composer install` on the server over SSH (SFTP only - see below). `true`: upload the changed `vendor/<package>/` directories directly (works over FTP too; useful when the server has no Composer/SSH). |
+| `sshPath` | `` | Working directory for the server-side `composer install`. Defaults to `path`; set it when `path` is chroot-relative and the SSH session needs the absolute path. |
+| `composerCommand` | `composer install -o --no-dev` | The command run on the server. e.g. `sudo -u www-data composer install -o --no-dev` to keep file ownership. |
+
+The server-side `composer install` runs **after** the changed files (including the new `composer.lock`) are uploaded, so it sees the new lock, and **before** the `REVISION` file is written and before the `after` hook - so a failed install (non-zero exit) aborts the deploy without marking it successful. git-deploy requires an env-specific lock snapshot at `.gitdeploy/<env>.composer.lock`; it is created/updated automatically after each successful deploy.
+
+### After-deploy hooks
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `after[]` | `[]` | URLs requested after the upload finishes, e.g. a script that runs DB migrations and clears caches. |
+
+The response is streamed line by line, so long-running hooks (heavy `ALTER`s, backfills) show live progress and finish reliably. cURL is used with a write callback because PHP's built-in `http://` stream wrapper buffers the whole body before returning. SSL peer verification is disabled (the URL comes from your trusted config and targets your own server). If the streamed body contains the marker `DEPLOY FAILED`, git-deploy aborts with a non-zero exit code - your hook can print that line to signal failure (the streamed HTTP status is locked at 200 once the first bytes flush).
+
+### Example deploy.ini
+
     [example]
-    
-    skip = false
-    user = example
-    pass = password
-    host = example.com
-    port = 21
-    path = /path/to/installation
-    passive = true
-    
-    ; If that seemed too long for you, you can specify servers like this:
-    [ftp://example:password@example.com:21/path/to/installation]
 
-The first time it's executed, git-deploy will assume that your deployment server is empty, and will upload all the files in the git repository.
-If you've already deployed your project's files previously, you have to create a REVISION file on your deployment server, containing the hash of the revision it's currently in.
-
-To get the hash of the current revision, you can use:
-
-    git rev-parse HEAD
-
-### SFTP & automatic Composer install
-
-Besides FTP, deployment over **SFTP** is supported - set `scheme = sftp` (the port then defaults to 22). SFTP can authenticate with a private key instead of a password:
-
-    [example]
+    ; ftp | ftps | sftp
     scheme = sftp
     host = example.com
+    port = 22
     user = deploy
     path = /var/www/app/
-    ; private-key auth - `pass` is used as the key passphrase (leave empty for an unencrypted key)
+
+    ; SFTP key auth - `pass` is the key passphrase (empty for an unencrypted key)
     privateKeyPath = /home/me/.ssh/deploy_key
     pass =
 
-When the deployed `composer.lock` changes its resolved packages, git-deploy can run `composer install` on the server over the same SSH connection (SFTP only). It runs **after** the changed files are uploaded - so it sees the new `composer.lock` - and aborts the deployment if Composer exits with a non-zero status:
+    ; take the app offline while uploading
+    maintenanceMode = true
+    indexPath = web/index.php
+    maintenancePath = web/.maintenance.php
 
-    ; absolute working directory for the SSH command (defaults to `path`)
+    ; run composer install on the server when packages change
     sshPath = /var/www/app/
-    ; the command to run (defaults to `composer install -o --no-dev`)
     composerCommand = "sudo -u www-data composer install -o --no-dev"
+
+    ; run migrations / clear caches after upload
+    after[] = 'https://example.com/_deployment/after.php?token=secret'
+
+    ; empty caches every deploy
+    ; clean_directories[] = temp/cache
 
 Advanced Usage
 --------------
 
 ### Revert a deployment
 
-If you deployed using git-deploy and you want to go back to the previous deployment, all you need is `--revert`:
-
-    php git-deploy [your_ini_file_name] --revert
-
-If you use deploy.ini (i.e., if you didn't give the .ini file a custom name), then you can simply use:
+Roll back to the previously deployed revision (Composer-managed libraries are **not** reverted):
 
     php git-deploy --revert
+    php git-deploy --env=staging --revert
 
 ### Deploy a specific commit
 
-    php git-deploy [your_ini_file_name] -r [your_commit_hash]
+    php git-deploy -r <commit_hash>
+    php git-deploy --env=staging -r <commit_hash>
 
-If you use deploy.ini (i.e., if you didn't give the .ini file a custom name), then you can simply use:
-
-    php git-deploy -r [your_commit_hash]
-
-Note: If you want to, instead of using a commit hash, you can use a tag, or any other identifier that git-diff can understand.
+A tag or any other git-diff-understood identifier works too.
 
 ### List files to upload and delete
 
-Sometimes, you may just want to see what files are to be uploaded to the FTP server, and which ones are to be deleted. In this case, you can use `-l` (lowercase L):
-
-    php git-deploy [your_ini_file_name] -l
-
-If you use deploy.ini (i.e., if you didn't give the .ini file a custom name), then you can simply use:
+Preview without deploying (lowercase L):
 
     php git-deploy -l
-
-Pretty simple, huh?
+    php git-deploy --env=staging -l
 
 How It Works
 ------------
-git-deploy stores file called REVISION on your server inside the root path to your application. This file stores the current revision of your application residing on your server.
 
-When you run a git deploy, git-deploy downloads the REVISION file, and checks to see what files are different between revisions and either upload the changed files or deletes them from the server.
+git-deploy stores a `REVISION` file in the remote `path`, containing the hash of the deployed revision. On each run it reads `REVISION`, diffs it against the target revision (`git diff --name-status`), and uploads the added/changed files and deletes the removed ones. It also writes `PREVIOUS_REVISION` so `--revert` can roll back.
 
-Suggestions, questions and complaints.
-----------
+For each changed file it uploads the content of the target revision (via `git show`), so uncommitted working-tree changes are never deployed. SFTP transfers use binary; FTP uploads always use binary mode too (ASCII mode corrupts large minified assets). Git submodules are detected at start-up.
 
-If you've got any suggestions, questions, or anything you don't like about git-deploy-php, [create an issue](https://github.com/BrunoDeBarros/git-deploy-php/issues). I'd really appreciate your feedback.
-Feel free to fork this project, if you want to contribute to it. 
+Credits
+-------
+
+Originally created by [Bruno De Barros](https://github.com/BrunoDeBarros/git-deploy-php). This fork ([Ciki/git-deploy-php](https://github.com/Ciki/git-deploy-php)) adds SFTP + key auth, maintenance mode, streamed after-deploy hooks, and Composer handling. Issues and contributions welcome at the [fork's issue tracker](https://github.com/Ciki/git-deploy-php/issues).
