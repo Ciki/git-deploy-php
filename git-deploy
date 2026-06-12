@@ -779,9 +779,15 @@ class Terra_Git
 				$this->output("Uploaded PREVIOUS_REVISION file.");
 			}
 
-			// update env-specific composer.lock file
-			if (file_exists($composerLockPath)) {
-				copy($composerLockPath, $envComposerLockPath);
+			// Update the env-specific composer.lock snapshot from the DEPLOYED revision, never from
+			// the working tree: a dirty local composer.lock (e.g. an uncommitted `composer update`)
+			// would otherwise poison the snapshot during an unrelated deploy, and the NEXT deploy
+			// that actually ships the lock would see "no packages changed" and skip the server-side
+			// `composer install`, leaving prod vendor stale.
+			$output = [];
+			exec("git show $revision:composer.lock", $output, $exitCode);
+			if ($exitCode === 0 && $output !== []) {
+				file_put_contents($envComposerLockPath, join("\n", $output) . "\n");
 			}
 		} else {
 			$this->output("No files to upload.");
