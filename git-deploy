@@ -811,7 +811,10 @@ class Terra_Git
 
 		if (!empty($server['after'])) {
 			foreach ($server['after'] as $url) {
-				$this->output("$url called, streaming response:");
+				// Mask the ?token=... value in log output (deploy logs/transcripts get shared);
+				// the request itself still carries the real token.
+				$urlLog = preg_replace('/([?&]token=)[^&\s]+/', '$1***', $url);
+				$this->output("$urlLog called, streaming response:");
 				// Stream the response line by line so long-running deploy hooks (e.g. DB
 				// migrations with heavy ALTERs) can finish before we exit and operators
 				// see progress / errors immediately. We use cURL with a write callback
@@ -860,7 +863,7 @@ class Terra_Git
 						$deployFailed = true;
 					}
 				}
-				$this->output("$url finished");
+				$this->output("$urlLog finished");
 				if ($deployFailed) {
 					$this->output('After-hook reported `DEPLOY FAILED` in stream body - aborting.');
 					exit(1);
