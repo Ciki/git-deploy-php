@@ -730,6 +730,9 @@ class Terra_Git
 			$sshCwd = $server['sshPath'] !== '' ? $server['sshPath'] : $server['path'];
 			$composerCmd = $server['composerCommand'] !== '' ? $server['composerCommand'] : 'composer install -o --no-dev';
 			$command = 'cd ' . escapeshellarg($sshCwd) . ' && ' . $composerCmd . ' 2>&1';
+			// phpseclib gives up on exec() after 10 s without output and closes the channel, which kills
+			// composer mid-install (packages removed, autoload not regenerated = fatal on every request)
+			$connection->setTimeout(0);
 			$sshOutput = $connection->exec($command);
 			$this->output("SSH Output:\n" . $sshOutput);
 			// `DEPLOY FAILED` marker aborts the run; the streamed deploy client also greps for
