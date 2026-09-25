@@ -325,6 +325,26 @@ class Terra_Git
 	}
 
 
+	/**
+	 * Regenerates the local Composer autoloader, without dev packages when $noDev is set. Aborts the deploy when
+	 * Composer fails - uploading a stale autoloader is what the caller guards against.
+	 */
+	function dumpAutoload(bool $noDev): void
+	{
+		$command = 'composer dump-autoload --optimize --no-scripts --working-dir=' . escapeshellarg(__DIR__)
+			. ($noDev ? ' --no-dev' : '') . ' 2>&1';
+		$output = [];
+		exec($command, $output, $exitCode);
+		if ($exitCode !== 0) {
+			$this->output("DEPLOY FAILED: `$command` exited with $exitCode:\n" . implode("\n", $output));
+			exit(1);
+		}
+		$this->output($noDev
+			? 'Composer: autoloader dumped without dev packages for the upload.'
+			: 'Composer: local autoloader with dev packages restored.');
+	}
+
+
 	function __destruct() {}
 
 
@@ -628,6 +648,15 @@ class Terra_Git
 
 						// if changed, copy composer/ & autoload.php
 						if ($composerLibChanged) {
+							// The local vendor/ is a dev install: its autoloader requires the bootstrap files of dev
+							// packages (phpstan, rector, ...), which are never uploaded, so uploading it as is makes
+							// every request on the server fatal. Upload one dumped without dev packages and restore
+							// the dev one afterwards, also when the deploy exits early. This script keeps the class
+							// map it loaded at start, so rewriting the files does not affect it.
+							$this->dumpAutoload(true);
+							register_shutdown_function(function (): void {
+								$this->dumpAutoload(false);
+							});
 							addFilesFromDirectory('vendor/composer/', $composerChangedFiles);
 							$composerChangedFiles['vendor/autoload.php'] = 'vendor/autoload.php';
 						}
