@@ -9,8 +9,10 @@ require_once VENDOR_DIR . '/autoload.php';
 use phpseclib3\Crypt\PublicKeyLoader;
 use phpseclib3\Net\SFTP;
 
-$opts = getopt("lr:", ["revert", 'env:']);
+$opts = getopt("lr:", ["revert", 'env:', 'maintenance']);
 $list = isset($opts['l']);
+// --maintenance serves web/.maintenance.php (503) from the upload until the after hooks finish, whatever the .ini says
+$forceMaintenance = isset($opts['maintenance']);
 $revision = isset($opts['r']) ? $opts['r'] : 'HEAD';
 $revert = isset($opts['revert']);
 $deploy = isset($opts['env']) ? $opts['env'] : 'deploy.ini';
@@ -219,6 +221,11 @@ class Terra_Git
 				'composerCommand' => '',
 			], $options);
 
+			global $forceMaintenance;
+			if ($forceMaintenance) {
+				$options['maintenanceMode'] = true;
+			}
+
 			if ($options['scheme'] === 'sftp' && $options['port'] == 21) {
 				$options['port'] = 22;
 			}
@@ -424,52 +431,7 @@ class Terra_Git
 		}
 
 		# Okay, let's connect to the server.
-
-		if ($server['scheme'] === 'sftp') {
-			$connection = new SFTP($server['host'], $server['port']);
-			if ($server['privateKeyPath'] !== '') {
-				if (!@file_exists($server['privateKeyPath'])) {
-					throw new Exception("Private key '{$server['privateKeyPath']}' does not exist.");
-				}
-				// `pass` doubles as the key passphrase; empty string = unencrypted key.
-				$credential = PublicKeyLoader::load(
-					file_get_contents($server['privateKeyPath']),
-					$server['pass'] !== '' ? $server['pass'] : false,
-				);
-			} else {
-				$credential = $server['pass'];
-			}
-			if (!$connection->login($server['user'], $credential)) {
-				throw new Exception("Could not login to {$server['host']} via SFTP (Tried to login as {$server['user']}).");
-			}
-			if (!$connection->chdir($server['path'])) {
-				throw new Exception("Could not change the SFTP directory to {$server['path']}.");
-			}
-			$this->currentPath = $server['path'];
-		} else {
-			if ($server['scheme'] === 'ftps') {
-				$connection = @ftp_ssl_connect($server['host'], $server['port']);
-			} else {
-				$connection = @ftp_connect($server['host'], $server['port']);
-			}
-
-			if (!$connection) {
-				throw new Exception("Could not connect to {$server['host']}.");
-			} else {
-				if (!ftp_login($connection, $server['user'], $server['pass'])) {
-					throw new Exception("Could not login to {$server['host']} (Tried to login as {$server['user']}).");
-				}
-
-				ftp_pasv($connection, $server['passive']);
-				ftp_set_option($connection, FTP_TIMEOUT_SEC, 300);
-
-				if (ftp_chdir($connection, $server['path'])) {
-					$this->currentPath = $server['path'];
-				} else {
-					throw new Exception("Could not change the FTP directory to {$server['path']}.");
-				}
-			}
-		}
+		$connection = $this->connect($server);
 
 		$this->output(("----------------------------"));
 		$this->output("Connected to {$server['host']}{$server['path']} via " . strtoupper($server['scheme']));
@@ -670,13 +632,13 @@ class Terra_Git
 		}
 
 		$maintenanceModeTurnedOn = false;
+		$indexPath = $server['indexPath'];
+		$maintenancePath = $server['maintenancePath'];
+		$tmpIndexPath = $indexPath . '.tmp';
 		// turn on "Maintenance mode" before uploading
 		if (
 			$server['maintenanceMode'] && !$isFirstTimeDeploy && (count($filesToUpload) > 0 or count($filesToDelete) > 0)
 		) {
-			$indexPath = $server['indexPath'];
-			$maintenancePath = $server['maintenancePath'];
-			$tmpIndexPath = $indexPath . '.tmp';
 			if ($server['scheme'] === 'sftp') {
 				$connection->rename($indexPath, $tmpIndexPath);
 				$connection->rename($maintenancePath, $indexPath);
@@ -690,6 +652,10 @@ class Terra_Git
 
 		// most of the time $localFile === $remoteFile - $remoteFile just defines path where $localFile gets uploaded
 		foreach ($filesToUpload as $localFile => $remoteFile) {
+			// the real index.php is parked under its .tmp name while the maintenance page serves - a new version goes there too
+			if ($maintenanceModeTurnedOn && $remoteFile === $indexPath) {
+				$remoteFile = $tmpIndexPath;
+			}
 			# Make sure the folder exists in the server.
 			$ret = $this->mkdir($connection, $remoteFile, $server['scheme']);
 			if ($ret === false) {
@@ -825,8 +791,21 @@ class Terra_Git
 			$this->output("No files to upload.");
 		}
 
-		# when uploading done turn off "Maintenance mode"
-		if ($maintenanceModeTurnedOn) {
+		if (!empty($server['file_permissions'])) {
+			$this->setFilePermissions($connection, $server['file_permissions'], $server['scheme']);
+		}
+
+		// the site stays down until the after hooks (migrations, cache clean) finish - new files with the old DI
+		// container or the old DB schema fail; the hooks are separate scripts, not served through index.php
+		$turnOffMaintenance = function () use ($maintenanceModeTurnedOn, $server, &$connection, $indexPath, $maintenancePath, $tmpIndexPath): void {
+			if (!$maintenanceModeTurnedOn) {
+				return;
+			}
+			// a long after hook (migrations) can outlive the idle connection
+			if ($server['scheme'] === 'sftp' ? !$connection->isConnected() : @ftp_pwd($connection) === false) {
+				$this->output('Reconnecting to turn the maintenance mode off');
+				$connection = $this->connect($server);
+			}
 			if ($server['scheme'] === 'sftp') {
 				$connection->rename($indexPath, $maintenancePath);
 				$connection->rename($tmpIndexPath, $indexPath);
@@ -835,11 +814,7 @@ class Terra_Git
 				ftp_rename($connection, $tmpIndexPath, $indexPath);
 			}
 			$this->output("Maintenance mode turned OFF");
-		}
-
-		if (!empty($server['file_permissions'])) {
-			$this->setFilePermissions($connection, $server['file_permissions'], $server['scheme']);
-		}
+		};
 
 		if (!empty($server['after'])) {
 			foreach ($server['after'] as $url) {
@@ -897,11 +872,13 @@ class Terra_Git
 				}
 				$this->output("$urlLog finished");
 				if ($deployFailed) {
+					$turnOffMaintenance();
 					$this->output('After-hook reported `DEPLOY FAILED` in stream body - aborting.');
 					exit(1);
 				}
 			}
 		}
+		$turnOffMaintenance();
 
 		$this->output("----------------------------");
 		$this->output("Finished working on {$server['host']}{$server['path']}");
@@ -912,6 +889,61 @@ class Terra_Git
 		} else {
 			@ftp_close($connection);
 		}
+	}
+
+
+	/**
+	 * Open the SFTP / FTP connection to the server and change into its deploy path.
+	 * @return SFTP|\FTP\Connection
+	 */
+	private function connect(array $server)
+	{
+		if ($server['scheme'] === 'sftp') {
+			$connection = new SFTP($server['host'], $server['port']);
+			if ($server['privateKeyPath'] !== '') {
+				if (!@file_exists($server['privateKeyPath'])) {
+					throw new Exception("Private key '{$server['privateKeyPath']}' does not exist.");
+				}
+				// `pass` doubles as the key passphrase; empty string = unencrypted key.
+				$credential = PublicKeyLoader::load(
+					file_get_contents($server['privateKeyPath']),
+					$server['pass'] !== '' ? $server['pass'] : false,
+				);
+			} else {
+				$credential = $server['pass'];
+			}
+			if (!$connection->login($server['user'], $credential)) {
+				throw new Exception("Could not login to {$server['host']} via SFTP (Tried to login as {$server['user']}).");
+			}
+			if (!$connection->chdir($server['path'])) {
+				throw new Exception("Could not change the SFTP directory to {$server['path']}.");
+			}
+			$this->currentPath = $server['path'];
+		} else {
+			if ($server['scheme'] === 'ftps') {
+				$connection = @ftp_ssl_connect($server['host'], $server['port']);
+			} else {
+				$connection = @ftp_connect($server['host'], $server['port']);
+			}
+
+			if (!$connection) {
+				throw new Exception("Could not connect to {$server['host']}.");
+			} else {
+				if (!ftp_login($connection, $server['user'], $server['pass'])) {
+					throw new Exception("Could not login to {$server['host']} (Tried to login as {$server['user']}).");
+				}
+
+				ftp_pasv($connection, $server['passive']);
+				ftp_set_option($connection, FTP_TIMEOUT_SEC, 300);
+
+				if (ftp_chdir($connection, $server['path'])) {
+					$this->currentPath = $server['path'];
+				} else {
+					throw new Exception("Could not change the FTP directory to {$server['path']}.");
+				}
+			}
+		}
+		return $connection;
 	}
 
 
