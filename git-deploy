@@ -423,9 +423,13 @@ class Terra_Git
 	function deployGit(array $server, string $revision = 'HEAD', bool $revert = false): void
 	{
 
-		if ($revision == 'HEAD') {
-			$revision = exec('git rev-parse HEAD');
+		// a full hash also for `-r <branch>`: it names the staged release and is written to REVISION
+		$output = [];
+		$commit = exec('git rev-parse --verify "' . $revision . '^{commit}"', $output, $exitCode);
+		if ($exitCode !== 0 || $commit === false) {
+			throw new Exception("Unknown revision '$revision'.");
 		}
+		$revision = $commit;
 
 		# Let's make sure the $path ends with a slash.
 
