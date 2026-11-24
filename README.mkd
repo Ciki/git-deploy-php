@@ -21,7 +21,7 @@ Via Composer:
 
     composer require --dev ciki/git-deploy-php
 
-or simply drop the `git-deploy` script into your project root. The script expects to live in the **project root** - it resolves `.gitdeploy/` (config) and `vendor/` (autoloader, for SFTP) relative to its own location.
+or simply drop the `git-deploy` script into your project root. The script expects to live in the **project root** - it resolves `.gitdeploy/` (config) and `vendor/` (autoloader, for SFTP) relative to its own location. For the [staged deploy](#staged-deploy) put `git-deploy-agent.php` next to it.
 
 Usage
 -----
@@ -32,7 +32,7 @@ Usage
 
 The first time it runs against a server, git-deploy assumes the server is empty and uploads every tracked file. On later runs it reads the `REVISION` file it stored on the server and uploads/deletes only what changed since then.
 
-*Note:* the script ignores itself (`git-deploy`) and `.gitignore` - they are never uploaded.
+*Note:* the script ignores itself (`git-deploy`, `git-deploy-agent.php`) and `.gitignore` - they are never uploaded into the live tree.
 
 ### Multiple environments
 
@@ -100,6 +100,29 @@ When the deployed `composer.lock` changes its **resolved packages** (detected by
 
 The server-side `composer install` runs **after** the changed files (including the new `composer.lock`) are uploaded, so it sees the new lock, and **before** the `REVISION` file is written and before the `after` hook - so a failed install (non-zero exit) aborts the deploy without marking it successful. git-deploy requires an env-specific lock snapshot at `.gitdeploy/<env>.composer.lock`; it is created/updated automatically after each successful deploy.
 
+### Staged deploy
+
+By default the changed files are uploaded straight into the live tree one by one: during a bigger upload the site runs a mix of old and new files, an interrupted upload leaves it half updated, and nothing checks that a file arrived intact. The staged deploy (SFTP only - the server-side steps run over SSH) avoids that:
+
+1. The release is uploaded to `.git-deploy/<rev>/files/` on the server together with `manifest.json` (size + sha1 of every file, the files to delete, revisions from/to) and the server script `.git-deploy/agent.php` (`git-deploy-agent.php`). The live tree does not change.
+2. The agent verifies every staged file against the manifest; only missing or corrupt files are uploaded again (up to 3 rounds). Running the same deploy again after an interrupted upload therefore sends just the rest. It also checks that it can write into every live target directory.
+3. The `beforeSwitch[]` commands run (e.g. DB migrations) while the old site keeps serving; a non-zero exit aborts with the live tree untouched.
+4. The maintenance page goes up (when enabled) - only now, not for the whole upload. With `--maintenance` it goes up before step 3 instead, for migrations the old code cannot run against (dropped or renamed tables and columns); a failing `beforeSwitch` command then takes it down again.
+5. The agent backs up every live file the release overwrites or deletes to `.git-deploy/<rev>/backup/`, then copies the staged files in (each via a temporary sibling + `rename()`, so no request sees a half-written file) and deletes the removed ones - a local disk operation, seconds instead of minutes. If anything fails, the files switched so far are restored and the deploy aborts.
+6. `composer install` (when packages changed), `REVISION`, the `after[]` hooks and the maintenance page removal follow as in the plain deploy.
+7. Only the newest `stagedKeep` releases (plus the deployed one) are kept.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `stagedDeploy` | `false` | Enable the staged deploy (needs `scheme = sftp`). The first deploy to an empty server is always a plain upload. |
+| `phpCommand` | `php` | How to run the agent on the server. The default runs it as the SFTP user, so it writes into the live tree with the same rights as a plain upload; use e.g. `sudo -u www-data php` when only the web server user can write there. |
+| `beforeSwitch[]` | `[]` | Shell commands run in `sshPath` after the verified upload, before the switch. `{staged}` is replaced with the absolute path of the staged files, e.g. `sudo -u www-data php bin/migrate.php --extra-dir={staged}/migrations` to run the release's new migrations against the database before the new code goes live. Such migrations must work with the old code too (add tables/columns/indexes; split renames and drops into two deploys, or deploy with `--maintenance`). |
+| `stagedKeep` | `5` | Releases kept on the server for `--rollback`. |
+
+Requirements on the server: the agent's user must be able to write into the deploy tree (with the default `phpCommand` that is the SFTP user, which a plain deploy needs anyway), and the `.git-deploy/` directory must not be served - keep the document root in a subdirectory (the agent also drops a `Require all denied` `.htaccess` there).
+
+The switch is fast but not atomic as a whole: requests during those seconds may still see a mix of files, and opcache may keep serving old bytecode until it revalidates. Clear caches and the opcache in an `after[]` hook as usual.
+
 ### After-deploy hooks
 
 | Key | Default | Description |
@@ -147,6 +170,12 @@ Roll back to the previously deployed revision (Composer-managed libraries are **
 
     php git-deploy --revert
     php git-deploy --env=staging --revert
+
+### Roll back a staged deployment
+
+With `stagedDeploy` the server keeps a backup of every file the deployed release overwrote or deleted. `--rollback` restores it (and removes the files the release added), sets `REVISION` back, runs `composer install` when the release changed `composer.lock`, and calls the `after[]` hooks - with `maintenanceMode` behind the maintenance page, as a deploy does. It works repeatedly as long as the older releases are still kept, and also after a deploy that stopped behind its switch (e.g. a failed `composer install`, which leaves `REVISION` and the maintenance page as they were): the agent records the revision of the live files in `.git-deploy/current`, and a maintenance page left up is taken down at the end. The database is **not** rolled back:
+
+    php git-deploy --env=production --rollback
 
 ### Deploy a specific commit
 

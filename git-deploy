@@ -9,12 +9,14 @@ require_once VENDOR_DIR . '/autoload.php';
 use phpseclib3\Crypt\PublicKeyLoader;
 use phpseclib3\Net\SFTP;
 
-$opts = getopt("lr:", ["revert", 'env:', 'maintenance']);
+$opts = getopt("lr:", ["revert", 'rollback', 'env:', 'maintenance']);
 $list = isset($opts['l']);
 // --maintenance serves web/.maintenance.php (503) from the upload until the after hooks finish, whatever the .ini says
 $forceMaintenance = isset($opts['maintenance']);
 $revision = isset($opts['r']) ? $opts['r'] : 'HEAD';
 $revert = isset($opts['revert']);
+// --rollback restores the files the last staged deploy overwrote or deleted (stagedDeploy only)
+$rollback = isset($opts['rollback']);
 $deploy = isset($opts['env']) ? $opts['env'] : 'deploy.ini';
 $deploy = GIT_DEPLOY_DIR . '/' . $deploy;
 if (substr($deploy, -4) !== '.ini') {
@@ -88,7 +90,9 @@ try {
 	$git = new Terra_Git();
 	if (!$list) {
 		$git->setDeployFile($deploy);
-		if ($revert) {
+		if ($rollback) {
+			$git->rollback();
+		} elseif ($revert) {
 			$git->revert();
 		} else {
 			$git->deploy($revision);
@@ -130,8 +134,12 @@ try {
 
 class Terra_Git
 {
+	/** server directory of the staged releases, relative to `path` / `sshPath` */
+	const STAGE_DIR = '.git-deploy';
+
 	protected array $filesToIgnore = [
 		'git-deploy',
+		'git-deploy-agent.php',
 		'.gitignore',
 	];
 	protected bool $print = true;
@@ -220,7 +228,22 @@ class Terra_Git
 				'sshPath' => '',
 				// Server-side composer command. Falls back to a sane default when empty.
 				'composerCommand' => '',
+				// Staged deploy (sftp only): upload into `.git-deploy/<rev>/files/`, verify on the server, run
+				// `beforeSwitch` commands, then copy the files into the live tree in one server-side step.
+				'stagedDeploy' => false,
+				// Commands run over SSH (in sshPath) after the verified upload, before the switch; a non-zero exit
+				// aborts the deploy with the live tree untouched. `{staged}` = absolute path of the staged files.
+				'beforeSwitch' => [],
+				// How to run PHP on the server for the staged-deploy agent. The default runs it as the SFTP user, with
+				// the same rights as a plain upload; e.g. "sudo -u www-data php" when only the web server user can write.
+				'phpCommand' => 'php',
+				// Number of staged releases kept on the server for --rollback.
+				'stagedKeep' => 5,
 			], $options);
+
+			if ($options['stagedDeploy'] && $options['scheme'] !== 'sftp') {
+				throw new Exception("stagedDeploy needs scheme = sftp - the server-side steps run over SSH ($uri).");
+			}
 
 			global $forceMaintenance;
 			if ($forceMaintenance) {
@@ -639,14 +662,22 @@ class Terra_Git
 			}
 		}
 
+		$staged = $server['stagedDeploy'] && (count($filesToUpload) > 0 || count($filesToDelete) > 0);
+		if ($staged && $isFirstTimeDeploy) {
+			$this->output('First-time deploy: uploading straight into the live tree, stagedDeploy applies from the next deploy.');
+			$staged = false;
+		}
+		if ($staged) {
+			// the live tree stays untouched until switchRelease()
+			$this->stageRelease($connection, $server, $revision, $remoteRevision, $filesToUpload, $filesToDelete, $composerChangedFiles ?? []);
+		}
+
 		$maintenanceModeTurnedOn = false;
 		$indexPath = $server['indexPath'];
 		$maintenancePath = $server['maintenancePath'];
 		$tmpIndexPath = $indexPath . '.tmp';
-		// turn on "Maintenance mode" before uploading
-		if (
-			$server['maintenanceMode'] && !$isFirstTimeDeploy && (count($filesToUpload) > 0 or count($filesToDelete) > 0)
-		) {
+		$useMaintenance = $server['maintenanceMode'] && !$isFirstTimeDeploy && (count($filesToUpload) > 0 or count($filesToDelete) > 0);
+		$turnOnMaintenance = function () use (&$maintenanceModeTurnedOn, $server, $connection, $indexPath, $maintenancePath, $tmpIndexPath): void {
 			if ($server['scheme'] === 'sftp') {
 				$connection->rename($indexPath, $tmpIndexPath);
 				$connection->rename($maintenancePath, $indexPath);
@@ -656,95 +687,85 @@ class Terra_Git
 			}
 			$this->output('Maintenance mode turned ON');
 			$maintenanceModeTurnedOn = true;
-		}
+		};
 
-		// most of the time $localFile === $remoteFile - $remoteFile just defines path where $localFile gets uploaded
-		foreach ($filesToUpload as $localFile => $remoteFile) {
-			// the real index.php is parked under its .tmp name while the maintenance page serves - a new version goes there too
-			if ($maintenanceModeTurnedOn && $remoteFile === $indexPath) {
-				$remoteFile = $tmpIndexPath;
-			}
-			# Make sure the folder exists in the server.
-			$ret = $this->mkdir($connection, $remoteFile, $server['scheme']);
-			if ($ret === false) {
-				$this->output("A problem occurred while attempting to create a folder. Upload to this server cannot continue.");
+		// the site stays down until the after hooks (migrations, cache clean) finish - new files with the old DI
+		// container or the old DB schema fail; the hooks are separate scripts, not served through index.php
+		$turnOffMaintenance = function () use (&$maintenanceModeTurnedOn, $server, &$connection, $indexPath, $maintenancePath, $tmpIndexPath): void {
+			if (!$maintenanceModeTurnedOn) {
 				return;
 			}
-
-			// first time we upload files as they are (working directory is clean)
-			// same for composerChangedFiles as they are not tracked with git
-			if ($isFirstTimeDeploy || isset($composerChangedFiles[$localFile])) {
-				$unlinkTmpFile = FALSE;
-				$tmpFileToUpload = $localFile;
-				// other times we upload tmp file with content of $revision
-			} else {
-				$unlinkTmpFile = TRUE;
-				$tmpFileToUpload = GIT_DEPLOY_DIR . '/tmpFileToUpload';
-				$command = "git show \"$revision:$localFile\" > \"$tmpFileToUpload\"";
-				$output = [];
-				exec($command, $output);
+			// a long after hook (migrations) can outlive the idle connection
+			if ($server['scheme'] === 'sftp' ? !$connection->isConnected() : @ftp_pwd($connection) === false) {
+				$this->output('Reconnecting to turn the maintenance mode off');
+				$connection = $this->connect($server);
 			}
-
-			$uploaded = false;
-			$attempts = 1;
-			while (!$uploaded) {
-
-				if ($attempts == 10) {
-					$this->output("Tried to upload $localFile 10 times, and failed 10 times. Something is wrong, so I'm going to stop executing now.");
-					exit;
-				}
-
-				# This makes sure to repeat the upload until it finally succeeds.
-				if ($server['scheme'] === 'sftp') {
-					$uploaded = $connection->put($remoteFile, $tmpFileToUpload, SFTP::SOURCE_LOCAL_FILE);
-				} else {
-					// Always use BINARY mode - ASCII mode corrupts large minified files (e.g. xlsx.full.min.js)
-					$uploaded = @ftp_put($connection, $remoteFile, $tmpFileToUpload, FTP_BINARY);
-				}
-
-				if (!$uploaded) {
-					$attempts = $attempts + 1;
-					$this->output("Failed to upload {$localFile}. Retrying (attempt $attempts/10)... ");
-					// Small delay before retry
-					usleep(500000);
-				}
-			}
-			$this->output("Uploaded {$localFile}");
-			if ($unlinkTmpFile) {
-				unlink($tmpFileToUpload);
-			}
-		}
-
-		foreach ($filesToDelete as $file) {
 			if ($server['scheme'] === 'sftp') {
-				$connection->delete($file);
+				$connection->rename($indexPath, $maintenancePath);
+				$connection->rename($tmpIndexPath, $indexPath);
 			} else {
-				@ftp_delete($connection, $file);
+				ftp_rename($connection, $indexPath, $maintenancePath);
+				ftp_rename($connection, $tmpIndexPath, $indexPath);
 			}
-			$this->output("Deleted {$file}");
+			$this->output("Maintenance mode turned OFF");
+		};
+
+		// a staged deploy keeps the old site up through its beforeSwitch migrations - except with --maintenance, which
+		// is there for migrations the old code cannot run against (dropped or renamed tables and columns)
+		global $forceMaintenance;
+		if ($useMaintenance && (!$staged || $forceMaintenance)) {
+			$turnOnMaintenance();
 		}
 
-		// Now that composer.json + composer.lock are uploaded, run the deferred server-side
+		if ($staged) {
+			if (!$this->runBeforeSwitch($connection, $server, $revision)) {
+				$turnOffMaintenance();
+				exit(1);
+			}
+			if ($useMaintenance && !$maintenanceModeTurnedOn) {
+				$turnOnMaintenance();
+			}
+			if (!$this->switchRelease($connection, $server, $revision, $maintenanceModeTurnedOn ? [$indexPath => $tmpIndexPath] : [])) {
+				$turnOffMaintenance();
+				$this->output('Switch failed - aborting.');
+				exit(1);
+			}
+		} else {
+			// most of the time $localFile === $remoteFile - $remoteFile just defines path where $localFile gets uploaded
+			foreach ($filesToUpload as $localFile => $remoteFile) {
+				// the real index.php is parked under its .tmp name while the maintenance page serves - a new version goes there too
+				if ($maintenanceModeTurnedOn && $remoteFile === $indexPath) {
+					$remoteFile = $tmpIndexPath;
+				}
+				// first time we upload files as they are (working directory is clean)
+				// same for composerChangedFiles as they are not tracked with git
+				if ($isFirstTimeDeploy || isset($composerChangedFiles[$localFile])) {
+					$this->uploadFile($connection, $server['scheme'], $localFile, $remoteFile, $localFile);
+				} else {
+					// other times we upload tmp file with content of $revision
+					$tmpFileToUpload = GIT_DEPLOY_DIR . '/tmpFileToUpload';
+					$this->exportRevisionFile($revision, $localFile, $tmpFileToUpload);
+					$this->uploadFile($connection, $server['scheme'], $tmpFileToUpload, $remoteFile, $localFile);
+					unlink($tmpFileToUpload);
+				}
+			}
+
+			foreach ($filesToDelete as $file) {
+				if ($server['scheme'] === 'sftp') {
+					$connection->delete($file);
+				} else {
+					@ftp_delete($connection, $file);
+				}
+				$this->output("Deleted {$file}");
+			}
+		}
+
+		// Now that composer.json + composer.lock are in the live tree, run the deferred server-side
 		// `composer install`. Done before REVISION is written (a failed install aborts without
 		// marking the deploy successful) and before the `after` hook (after.php loads the app
 		// + vendor, so it must see the new packages).
 		if ($runComposerInstallOnServer) {
-			$this->output('A change in composer managed libraries detected.. Running `composer install` on server via SSH.');
-			$sshCwd = $server['sshPath'] !== '' ? $server['sshPath'] : $server['path'];
-			$composerCmd = $server['composerCommand'] !== '' ? $server['composerCommand'] : 'composer install -o --no-dev';
-			$command = 'cd ' . escapeshellarg($sshCwd) . ' && ' . $composerCmd . ' 2>&1';
-			// phpseclib gives up on exec() after 10 s without output and closes the channel, which kills
-			// composer mid-install (packages removed, autoload not regenerated = fatal on every request)
-			$connection->setTimeout(0);
-			$sshOutput = $connection->exec($command);
-			$this->output("SSH Output:\n" . $sshOutput);
-			// `DEPLOY FAILED` marker aborts the run; the streamed deploy client also greps for
-			// it. exec() exit status is the authoritative signal.
-			if ($connection->getExitStatus() !== 0) {
-				$this->output('DEPLOY FAILED: `composer install` exited with a non-zero status.');
-				exit(1);
-			}
-			$this->output('`composer install` command has been executed.');
+			$this->runComposerInstall($connection, $server);
 		}
 
 		if (!empty($server['clean_directories'])) {
@@ -785,16 +806,7 @@ class Terra_Git
 				$this->output("Uploaded PREVIOUS_REVISION file.");
 			}
 
-			// Update the env-specific composer.lock snapshot from the DEPLOYED revision, never from
-			// the working tree: a dirty local composer.lock (e.g. an uncommitted `composer update`)
-			// would otherwise poison the snapshot during an unrelated deploy, and the NEXT deploy
-			// that actually ships the lock would see "no packages changed" and skip the server-side
-			// `composer install`, leaving prod vendor stale.
-			$output = [];
-			exec("git show $revision:composer.lock", $output, $exitCode);
-			if ($exitCode === 0 && $output !== []) {
-				file_put_contents($envComposerLockPath, join("\n", $output) . "\n");
-			}
+			$this->storeComposerLockSnapshot($server, $revision);
 		} else {
 			$this->output("No files to upload.");
 		}
@@ -803,27 +815,270 @@ class Terra_Git
 			$this->setFilePermissions($connection, $server['file_permissions'], $server['scheme']);
 		}
 
-		// the site stays down until the after hooks (migrations, cache clean) finish - new files with the old DI
-		// container or the old DB schema fail; the hooks are separate scripts, not served through index.php
-		$turnOffMaintenance = function () use ($maintenanceModeTurnedOn, $server, &$connection, $indexPath, $maintenancePath, $tmpIndexPath): void {
-			if (!$maintenanceModeTurnedOn) {
-				return;
-			}
+		if (!$this->runAfterHooks($server)) {
+			$turnOffMaintenance();
+			$this->output('After-hook reported `DEPLOY FAILED` in stream body - aborting.');
+			exit(1);
+		}
+		$turnOffMaintenance();
+
+		if ($staged) {
 			// a long after hook (migrations) can outlive the idle connection
-			if ($server['scheme'] === 'sftp' ? !$connection->isConnected() : @ftp_pwd($connection) === false) {
-				$this->output('Reconnecting to turn the maintenance mode off');
+			if (!$connection->isConnected()) {
 				$connection = $this->connect($server);
 			}
-			if ($server['scheme'] === 'sftp') {
-				$connection->rename($indexPath, $maintenancePath);
-				$connection->rename($tmpIndexPath, $indexPath);
-			} else {
-				ftp_rename($connection, $indexPath, $maintenancePath);
-				ftp_rename($connection, $tmpIndexPath, $indexPath);
+			[$cleanupOutput] = $this->sshExec($connection, $server, $this->agentCommand($server) . ' cleanup ' . (int) $server['stagedKeep'] . ' ' . self::shellQuote($revision));
+			$this->output(rtrim($cleanupOutput));
+		}
+
+		$this->output("----------------------------");
+		$this->output("Finished working on {$server['host']}{$server['path']}");
+		$this->output("----------------------------");
+
+		if ($server['scheme'] === 'sftp') {
+			$connection->disconnect();
+		} else {
+			@ftp_close($connection);
+		}
+	}
+
+
+	/**
+	 * Restores the files the last staged deploy overwrote or deleted (see git-deploy-agent.php) and runs the after hooks.
+	 * The database is not rolled back - migrations have to stay compatible with the previous code.
+	 */
+	function rollback(): void
+	{
+		foreach ($this->servers as $server) {
+			if (!$server['stagedDeploy']) {
+				throw new Exception('--rollback needs stagedDeploy = true: only staged deploys keep a backup on the server.');
 			}
-			$this->output("Maintenance mode turned OFF");
+			$this->rollbackServer($server);
+		}
+	}
+
+
+	private function rollbackServer(array $server): void
+	{
+		$connection = $this->connect($server);
+		$revision = $this->getRemoteRevisionContent($connection, 'REVISION', 'sftp');
+		// the agent's record of the live files - REVISION lags behind when a deploy stopped after its switch (composer
+		// install); trusted only when its release continues from REVISION, a later plain deploy leaves it stale
+		$current = $connection->get(self::STAGE_DIR . '/current');
+		$current = is_string($current) ? trim($current) : '';
+		if ($current !== '' && $current !== $revision && ($this->readStagedManifest($connection, $current)['from'] ?? null) === $revision) {
+			$revision = $current;
+		}
+		$manifest = $revision !== null ? $this->readStagedManifest($connection, $revision) : null;
+		if (empty($manifest['from'])) {
+			throw new Exception("The server keeps no staged release of the deployed revision '$revision' to roll back.");
+		}
+		$from = (string) $manifest['from'];
+		$this->output("Rolling back {$server['host']}{$server['path']} from " . substr($revision, 0, 9) . ' to ' . substr($from, 0, 9) . '.');
+
+		// a deploy that stopped after its switch left the maintenance page up, the real index.php parked under .tmp;
+		// otherwise it goes up as in a deploy - the restored files fail with the new DI container until the after hooks
+		$indexPath = $server['indexPath'];
+		$maintenancePath = $server['maintenancePath'];
+		$tmpIndexPath = $indexPath . '.tmp';
+		$maintenanceLeftUp = $connection->file_exists($tmpIndexPath);
+		$maintenanceOn = $maintenanceLeftUp;
+		if (!$maintenanceOn && $server['maintenanceMode']) {
+			$connection->rename($indexPath, $tmpIndexPath);
+			$connection->rename($maintenancePath, $indexPath);
+			$maintenanceOn = true;
+			$this->output('Maintenance mode turned ON');
+		}
+		$turnOffMaintenance = function () use ($maintenanceOn, $server, &$connection, $indexPath, $maintenancePath, $tmpIndexPath): void {
+			if (!$maintenanceOn) {
+				return;
+			}
+			if (!$connection->isConnected()) {
+				$connection = $this->connect($server);
+			}
+			$connection->rename($indexPath, $maintenancePath);
+			$connection->rename($tmpIndexPath, $indexPath);
+			$this->output('Maintenance mode turned OFF');
 		};
 
+		$command = $this->agentCommand($server) . ' rollback ' . self::shellQuote($revision);
+		if ($maintenanceOn) {
+			$command .= ' ' . self::shellQuote("--parked=$indexPath=$tmpIndexPath");
+		}
+		[$agentOutput, $exitCode] = $this->sshExec($connection, $server, $command);
+		$this->output(rtrim($agentOutput));
+		if ($exitCode !== 0) {
+			// a page the stopped deploy left up stays - its live tree still is not what the old code needs
+			if (!$maintenanceLeftUp) {
+				$turnOffMaintenance();
+			}
+			$this->output('Rollback failed - aborting.');
+			exit(1);
+		}
+
+		$this->writeRemoteFile($connection, 'REVISION', $from);
+		$this->writeRemoteFile($connection, 'PREVIOUS_REVISION', $revision);
+		file_put_contents(getRemoteRevisionLocalFilepath(), $from);
+		$this->storeComposerLockSnapshot($server, $from);
+		$this->output('REVISION set back to ' . substr($from, 0, 9) . '.');
+
+		// the restored composer.lock describes the packages the old code needs
+		if (isset($manifest['upload']['composer.lock'])) {
+			$this->runComposerInstall($connection, $server);
+		}
+		if (!$this->runAfterHooks($server)) {
+			$turnOffMaintenance();
+			$this->output('After-hook reported `DEPLOY FAILED` in stream body - aborting.');
+			exit(1);
+		}
+		$turnOffMaintenance();
+		$this->output("Finished rolling back {$server['host']}{$server['path']}");
+		$connection->disconnect();
+	}
+
+
+	/**
+	 * @return array<string, mixed>|null the manifest of a release kept in STAGE_DIR, null when there is none
+	 */
+	private function readStagedManifest($connection, string $revision): ?array
+	{
+		$json = $connection->get(self::STAGE_DIR . "/$revision/manifest.json");
+		$manifest = is_string($json) ? json_decode($json, true) : null;
+		return is_array($manifest) ? $manifest : null;
+	}
+
+
+	/**
+	 * Uploads the release into STAGE_DIR/<rev>/files/ with its manifest and has the server verify it: only missing or
+	 * corrupt files are (re)uploaded, so a repeated deploy of an interrupted upload sends just the rest. Exits the deploy
+	 * on any failure - the live tree is not touched before switchRelease().
+	 * @param array<string, string> $filesToUpload local path => remote path
+	 * @param array<string, string> $filesToDelete local path => remote path
+	 * @param array<string, string> $untrackedFiles files uploaded from the working tree as they are (composer libs)
+	 */
+	private function stageRelease($connection, array $server, string $revision, ?string $remoteRevision, array $filesToUpload, array $filesToDelete, array $untrackedFiles): void
+	{
+		$releaseDir = self::STAGE_DIR . '/' . $revision;
+		$localDir = GIT_DEPLOY_DIR . '/stage-' . $server['env'];
+		$this->removeLocalDir($localDir);
+
+		$localFiles = []; // remote path => local file holding its content
+		$manifestFiles = [];
+		foreach ($filesToUpload as $localFile => $remoteFile) {
+			if (isset($untrackedFiles[$localFile])) {
+				$localPath = $localFile;
+			} else {
+				$localPath = $localDir . '/' . $remoteFile;
+				$this->exportRevisionFile($revision, $localFile, $localPath);
+			}
+			$localFiles[$remoteFile] = $localPath;
+			$manifestFiles[$remoteFile] = ['size' => filesize($localPath), 'sha1' => sha1_file($localPath)];
+		}
+		$manifest = [
+			'from' => $remoteRevision,
+			'to' => $revision,
+			'created' => date('c'),
+			'upload' => $manifestFiles,
+			'delete' => array_values($filesToDelete),
+		];
+		$this->writeRemoteFile($connection, self::STAGE_DIR . '/agent.php', file_get_contents(__DIR__ . '/git-deploy-agent.php'));
+		$this->writeRemoteFile($connection, $releaseDir . '/manifest.json', json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+
+		$verifyCommand = $this->agentCommand($server) . ' verify ' . self::shellQuote($revision);
+		for ($round = 1; ; $round++) {
+			[$verifyOutput, $exitCode] = $this->sshExec($connection, $server, $verifyCommand);
+			$lines = preg_split('/\R/', trim($verifyOutput));
+			$result = $exitCode === 0 ? json_decode((string) end($lines), true) : null;
+			if (!is_array($result) || !isset($result['bad'], $result['unwritable']) || array_diff($result['bad'], array_keys($localFiles)) !== []) {
+				$this->output("DEPLOY FAILED: the server could not verify the staged release:\n" . $verifyOutput);
+				exit(1);
+			}
+			if ($result['unwritable'] !== []) {
+				$this->output("DEPLOY FAILED: the server-side user cannot write into these live directories (make them group-writable):\n  "
+					. implode("\n  ", $result['unwritable']));
+				exit(1);
+			}
+			$bad = $result['bad'];
+			if ($bad === []) {
+				break;
+			}
+			if ($round > 3) {
+				$this->output("DEPLOY FAILED: still missing or corrupt after 3 uploads: " . implode(', ', $bad));
+				exit(1);
+			}
+			$this->output($round === 1
+				? sprintf('Uploading %d of %d file(s) to %s/', count($bad), count($localFiles), $releaseDir)
+				: sprintf('Verification found %d missing or corrupt file(s), uploading them again', count($bad)));
+			foreach ($bad as $remoteFile) {
+				$this->uploadFile($connection, 'sftp', $localFiles[$remoteFile], $releaseDir . '/files/' . $remoteFile, $remoteFile);
+			}
+		}
+		$this->output(sprintf('Staged release verified: %d file(s) to copy in, %d to delete.', count($localFiles), count($filesToDelete)));
+		$this->removeLocalDir($localDir);
+	}
+
+
+	/**
+	 * Runs the beforeSwitch commands of a verified staged release, stopping at the first non-zero exit.
+	 * @return bool false when a command failed - the live tree is untouched
+	 */
+	private function runBeforeSwitch($connection, array $server, string $revision): bool
+	{
+		foreach ($server['beforeSwitch'] as $command) {
+			$command = str_replace('{staged}', $this->sshCwd($server) . '/' . self::STAGE_DIR . '/' . $revision . '/files', $command);
+			$this->output("Before switch: $command");
+			[$commandOutput, $exitCode] = $this->sshExec($connection, $server, $command);
+			if (trim($commandOutput) !== '') {
+				$this->output('  ' . str_replace("\n", "\n  ", rtrim($commandOutput)));
+			}
+			if ($exitCode !== 0) {
+				$this->output("DEPLOY FAILED: the before-switch command exited with $exitCode, the live tree was not touched.");
+				return false;
+			}
+		}
+		return true;
+	}
+
+
+	/**
+	 * Has the server back up the live files and move the staged release in.
+	 * @param array<string, string> $parked manifest path => live path currently holding it (index.php under maintenance)
+	 * @return bool false when the switch failed - the agent has then restored the old files
+	 */
+	private function switchRelease($connection, array $server, string $revision, array $parked): bool
+	{
+		$command = $this->agentCommand($server) . ' switch ' . self::shellQuote($revision);
+		foreach ($parked as $path => $target) {
+			$command .= ' ' . self::shellQuote("--parked=$path=$target");
+		}
+		[$agentOutput, $exitCode] = $this->sshExec($connection, $server, $command);
+		$this->output(rtrim($agentOutput));
+		return $exitCode === 0;
+	}
+
+
+	private function runComposerInstall($connection, array $server): void
+	{
+		$this->output('A change in composer managed libraries detected.. Running `composer install` on server via SSH.');
+		$composerCmd = $server['composerCommand'] !== '' ? $server['composerCommand'] : 'composer install -o --no-dev';
+		[$sshOutput, $exitCode] = $this->sshExec($connection, $server, $composerCmd);
+		$this->output("SSH Output:\n" . $sshOutput);
+		// `DEPLOY FAILED` marker aborts the run; the streamed deploy client also greps for
+		// it. exec() exit status is the authoritative signal.
+		if ($exitCode !== 0) {
+			$this->output('DEPLOY FAILED: `composer install` exited with a non-zero status.');
+			exit(1);
+		}
+		$this->output('`composer install` command has been executed.');
+	}
+
+
+	/**
+	 * Calls the `after` URLs and streams their output.
+	 * @return bool false when a hook reported `DEPLOY FAILED`
+	 */
+	private function runAfterHooks(array $server): bool
+	{
 		if (!empty($server['after'])) {
 			foreach ($server['after'] as $url) {
 				// Mask the ?token=... value in log output (deploy logs/transcripts get shared);
@@ -880,22 +1135,136 @@ class Terra_Git
 				}
 				$this->output("$urlLog finished");
 				if ($deployFailed) {
-					$turnOffMaintenance();
-					$this->output('After-hook reported `DEPLOY FAILED` in stream body - aborting.');
-					exit(1);
+					return false;
 				}
 			}
 		}
-		$turnOffMaintenance();
+		return true;
+	}
 
-		$this->output("----------------------------");
-		$this->output("Finished working on {$server['host']}{$server['path']}");
-		$this->output("----------------------------");
 
-		if ($server['scheme'] === 'sftp') {
-			$connection->disconnect();
-		} else {
-			@ftp_close($connection);
+	/**
+	 * Runs a shell command in the server's sshPath over the SFTP connection's SSH session.
+	 * @return array{string, int|false} output (stderr included) and exit status
+	 */
+	private function sshExec($connection, array $server, string $command): array
+	{
+		// phpseclib gives up on exec() after 10 s without output and closes the channel, which kills
+		// e.g. composer mid-install (packages removed, autoload not regenerated = fatal on every request)
+		$connection->setTimeout(0);
+		$output = $connection->exec('cd ' . self::shellQuote($this->sshCwd($server)) . ' && ' . $command . ' 2>&1');
+		return [(string) $output, $connection->getExitStatus()];
+	}
+
+
+	private function sshCwd(array $server): string
+	{
+		return rtrim($server['sshPath'] !== '' ? $server['sshPath'] : $server['path'], '/');
+	}
+
+
+	private function agentCommand(array $server): string
+	{
+		return $server['phpCommand'] . ' ' . self::STAGE_DIR . '/agent.php';
+	}
+
+
+	/**
+	 * POSIX shell quoting for commands run on the server - escapeshellarg() quotes for the LOCAL shell (cmd.exe on Windows).
+	 */
+	private static function shellQuote(string $arg): string
+	{
+		return "'" . str_replace("'", "'\\''", $arg) . "'";
+	}
+
+
+	/**
+	 * Uploads a local file, retrying up to 10 times; ends the deploy when it keeps failing.
+	 */
+	private function uploadFile($connection, string $scheme, string $localPath, string $remoteFile, string $label): void
+	{
+		# Make sure the folder exists in the server.
+		if (!$this->mkdir($connection, $remoteFile, $scheme)) {
+			$this->output("A problem occurred while attempting to create a folder. Upload to this server cannot continue.");
+			exit(1);
+		}
+		for ($attempt = 1; ; $attempt++) {
+			if ($scheme === 'sftp') {
+				$uploaded = $connection->put($remoteFile, $localPath, SFTP::SOURCE_LOCAL_FILE);
+			} else {
+				// Always use BINARY mode - ASCII mode corrupts large minified files (e.g. xlsx.full.min.js)
+				$uploaded = @ftp_put($connection, $remoteFile, $localPath, FTP_BINARY);
+			}
+			if ($uploaded) {
+				break;
+			}
+			if ($attempt === 10) {
+				$this->output("Tried to upload $label 10 times, and failed 10 times. Something is wrong, so I'm going to stop executing now.");
+				exit(1);
+			}
+			$this->output("Failed to upload {$label}. Retrying (attempt " . ($attempt + 1) . "/10)... ");
+			usleep(500000);
+		}
+		$this->output("Uploaded {$label}");
+	}
+
+
+	/**
+	 * Writes a string to a server file (sftp), creating its directory.
+	 */
+	private function writeRemoteFile($connection, string $remoteFile, string $content): void
+	{
+		if (!$this->mkdir($connection, $remoteFile, 'sftp') || !$connection->put($remoteFile, $content)) {
+			throw new Exception("Cannot write $remoteFile on the server.");
+		}
+	}
+
+
+	/**
+	 * Writes the content of $file at $revision to $destination.
+	 */
+	private function exportRevisionFile(string $revision, string $file, string $destination): void
+	{
+		if (!is_dir(dirname($destination)) && !mkdir(dirname($destination), 0777, true)) {
+			throw new Exception("Cannot create the directory of $destination.");
+		}
+		$output = [];
+		exec("git show \"$revision:$file\" > \"$destination\"", $output, $exitCode);
+		if ($exitCode !== 0) {
+			throw new Exception("`git show $revision:$file` failed.");
+		}
+	}
+
+
+	private function removeLocalDir(string $dir): void
+	{
+		if (!is_dir($dir)) {
+			return;
+		}
+		$items = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
+			RecursiveIteratorIterator::CHILD_FIRST,
+		);
+		foreach ($items as $item) {
+			$item->isDir() ? rmdir($item->getPathname()) : unlink($item->getPathname());
+		}
+		rmdir($dir);
+	}
+
+
+	/**
+	 * Updates the env-specific composer.lock snapshot from the DEPLOYED revision, never from
+	 * the working tree: a dirty local composer.lock (e.g. an uncommitted `composer update`)
+	 * would otherwise poison the snapshot during an unrelated deploy, and the NEXT deploy
+	 * that actually ships the lock would see "no packages changed" and skip the server-side
+	 * `composer install`, leaving prod vendor stale.
+	 */
+	private function storeComposerLockSnapshot(array $server, string $revision): void
+	{
+		$output = [];
+		exec("git show $revision:composer.lock", $output, $exitCode);
+		if ($exitCode === 0 && $output !== []) {
+			file_put_contents(GIT_DEPLOY_DIR . '/' . $server['env'] . '.composer.lock', join("\n", $output) . "\n");
 		}
 	}
 
