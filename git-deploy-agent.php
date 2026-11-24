@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-/**
+/*
  * Server side of the git-deploy staged mode. git-deploy uploads this file to <root>/.git-deploy/agent.php
  * on every staged deploy and runs it over SSH (`phpCommand`, by default as the SFTP user):
  *
