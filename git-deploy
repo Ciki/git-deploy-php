@@ -390,6 +390,9 @@ class Terra_Git
 								return false;
 							}
 						} else {
+							// the SFTP umask strips the group-write bit; the web server user (group) writes here too -
+							// composer, runtime caches, a staged-deploy agent run as it. Keeps the parent's setgid bit.
+							$connection->chmod(0775 | ((int) $connection->fileperms(dirname($path)) & 02000), $path);
 							$this->output("Created directory '$path'.");
 						}
 					}
