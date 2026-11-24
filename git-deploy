@@ -124,7 +124,8 @@ try {
 		}
 	}
 } catch (Exception $e) {
-	echo $e->getMessage();
+	echo $e->getMessage() . "\r\n";
+	exit(1);
 }
 
 class Terra_Git
